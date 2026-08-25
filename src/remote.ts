@@ -1,4 +1,6 @@
-import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { bindTypertRemote, Remote } from '@deepseek-ai/dsh-typert-protocol'
+import type { TypertGatewayBinding } from '@deepseek-ai/dsh-typert-protocol'
+import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import type { EngineSuiteService } from './plugin.js'
 import type { EngineSelection } from './profile/types.js'
@@ -22,9 +24,10 @@ export interface EngineSuiteCreateAgentResponse {
 }
 
 /** Host remote surface used by the client selector and settings UI. */
-export class EngineSuiteGateway extends TypertRemoteService {
+export class EngineSuiteGateway extends Service {
   static inject = ['engineSuite']
 
+  readonly typertRemote: TypertGatewayBinding<this> = bindTypertRemote(this, 'engineSuiteGateway')
   declare readonly engineSuite: EngineSuiteService
 
   constructor(ctx: Context) {
