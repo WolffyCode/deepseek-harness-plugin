@@ -95,8 +95,8 @@ test('Codex config materialization keeps the API key out of config.toml', async 
 })
 
 test('EngineSuite opens an isolated Codex launch from a resolved profile', async () => {
-  const { createEngineSuite } = await import('../src/index.js')
-  const suite = createEngineSuite()
+  const { createEngineSuiteRuntime } = await import('../src/engine-suite.js')
+  const suite = createEngineSuiteRuntime()
   suite.providers.register({
     id: 'launch-provider',
     engineId: 'codex-cli',

@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { agentEvents, type AgentHandle, type AgentOptions } from '@deepseek-ai/dsh-agent'
 import { SessionId, type Session } from '@deepseek-ai/dsh-session'
-import type { EngineSuite } from '../index.js'
+import type { EngineSuiteRuntime } from '../engine-suite.js'
 import type { EngineSelection } from '../profile/types.js'
 import { ExternalCodexAgent } from './external-codex-agent.js'
 
@@ -25,7 +25,7 @@ export class EngineSuiteAgentService {
 
   constructor(
     private readonly ctx: Context,
-    private readonly suite: EngineSuite,
+    private readonly suite: EngineSuiteRuntime,
   ) {
     ctx.effect(() => async () => {
       const handles = [...this.live]

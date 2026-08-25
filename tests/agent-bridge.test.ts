@@ -23,6 +23,7 @@ test('EngineSuite registers a Codex Agent that projects CLI output into a Harnes
   await ctx.plugin(AgentRegistry)
   apply(ctx)
   const suite = ctx.get('engineSuite')
+  assert.ok(suite)
   suite.providers.register({
     id: 'fixture-provider',
     engineId: 'codex-cli',

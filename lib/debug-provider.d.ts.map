@@ -1,0 +1,1 @@
+{"version":3,"file":"debug-provider.d.ts","sourceRoot":"","sources":["../src/debug-provider.ts"],"names":[],"mappings":"AAAA,OAAO,EAAoB,KAAK,mBAAmB,EAAE,MAAM,qBAAqB,CAAA;AAEhF,MAAM,WAAW,sBAAsB;IACrC,QAAQ,CAAC,QAAQ,EAAE,mBAAmB,CAAA;IACtC,QAAQ,CAAC,MAAM,EAAE,MAAM,CAAA;CACxB;AAED,wBAAgB,0BAA0B,CACxC,GAAG,EAAE,MAAM,CAAC,MAAM,EAAE,MAAM,GAAG,SAAS,CAAC,GACtC,sBAAsB,GAAG,SAAS,CAsBpC"}
