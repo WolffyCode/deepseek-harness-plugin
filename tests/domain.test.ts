@@ -82,3 +82,17 @@ test('reads the debug provider only from environment values', () => {
   assert.equal(seed?.apiKey, 'secret-for-test')
   assert.equal(readDebugCodexProviderSeed({}), undefined)
 })
+
+test('bundle entry publishes one EngineSuite service', async () => {
+  const { apply } = await import('../src/plugin.js')
+  let providedName = ''
+  let providedValue: unknown
+  apply({
+    provide(name, value) {
+      providedName = name
+      providedValue = value
+    },
+  })
+  assert.equal(providedName, 'engineSuite')
+  assert.ok(providedValue !== undefined)
+})

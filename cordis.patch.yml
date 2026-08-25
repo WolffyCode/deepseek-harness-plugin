@@ -1,0 +1,4 @@
+# One installable bundle entry. Internal EngineSuite capabilities are mounted by src/plugin.ts.
+- insert:
+    - id: engine-suite
+      name: '@wolffycode/dsh-engine-suite'

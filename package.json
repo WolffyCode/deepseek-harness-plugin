@@ -16,7 +16,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "cordis.patch.yml"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -27,5 +28,12 @@
     "tsx": "^4.20.3",
     "typescript": "^5.9.2",
     "@types/node": "^22.18.6"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
