@@ -72,6 +72,12 @@ options; discovery failure must eventually support manual model registration. Co
 is metadata, not proof of service-side support. The UI may expose a 1M toggle, while the domain
 stores a numeric `contextWindowTokens` and its source.
 
+## Agent bridge
+
+The plugin-owned `EngineSuiteAgentService` creates an external Codex Agent, enters its Session and Agent into the Harness registries, and owns teardown. This path intentionally uses the public `SessionStore` and `AgentRegistry` lifecycle primitives rather than replacing Harness source files.
+
+The first Agent bridge is intentionally narrow: Codex owns its tool loop, while the bridge projects user messages, text deltas, assistant messages, turn boundaries, status, cancellation, and process teardown. Codex tool activity remains engine activity and is never replayed as a Harness tool call.
+
 ## Parent/child policy
 
 Every Agent owns one EngineProfile snapshot. A child may use a different profile, but the parent

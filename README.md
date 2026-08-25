@@ -16,6 +16,7 @@ This repository currently contains the first domain foundation only:
 - Versioned EngineProfile resolution.
 - A local-only Codex debug-provider seed reader.
 - Codex app-server JSON-RPC transport, process lifecycle, and launch config materialization.
+- A plugin-owned Codex Agent bridge that publishes CLI output into a Harness Session.
 
 Harness/Cordis integration is deliberately not included yet. The next step is to bind this tested
 Codex runtime to the Harness Agent/Session and plugin lifecycle contracts.

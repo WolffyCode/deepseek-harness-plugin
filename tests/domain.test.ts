@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { Context } from '@deepseek-ai/cordis'
 import test from 'node:test'
 import { createEngineSuite, readDebugCodexProviderSeed } from '../src/index.js'
 
@@ -85,14 +86,8 @@ test('reads the debug provider only from environment values', () => {
 
 test('bundle entry publishes one EngineSuite service', async () => {
   const { apply } = await import('../src/plugin.js')
-  let providedName = ''
-  let providedValue: unknown
-  apply({
-    provide(name, value) {
-      providedName = name
-      providedValue = value
-    },
-  })
-  assert.equal(providedName, 'engineSuite')
+  const ctx = new Context()
+  apply(ctx)
+  const providedValue = ctx.get('engineSuite')
   assert.ok(providedValue !== undefined)
 })
