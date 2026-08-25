@@ -136,3 +136,39 @@ test('EngineSuite opens an isolated Codex launch from a resolved profile', async
   assert.match(launch.codexHome, /codex-home$/)
   await launch.close()
 })
+
+test('Codex model discovery normalizes model and reasoning metadata', async () => {
+  const { discoverCodexModels } = await import('../src/codex/discovery.js')
+  const script = [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n');",
+    "else if(m.method==='model/list') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{data:[{id:'model-one',model:'model-one',displayName:'Model One',description:'fixture',hidden:false,isDefault:true,defaultReasoningEffort:'high',supportedReasoningEfforts:[{reasoningEffort:'low',description:'low'},{reasoningEffort:'high',description:'high'}]}],nextCursor:null}})+'\\n');",
+    "});",
+  ].join('')
+  const models = await discoverCodexModels({
+    provider: {
+      id: 'discovery-provider',
+      engineId: 'codex-cli',
+      name: 'Discovery Provider',
+      baseUri: 'https://example.test',
+      credentialRef: 'discovery-credential',
+      wireApi: 'responses',
+      authMode: 'api-key',
+      enabled: true,
+      status: 'unknown',
+    },
+    apiKey: 'discovery-secret',
+    cwd: process.cwd(),
+    executable: process.execPath,
+    args: ['-e', script],
+  })
+  assert.equal(models.length, 1)
+  assert.equal(models[0]?.modelId, 'model-one')
+  assert.deepEqual(models[0]?.reasoningOptions, [
+    { id: 'low', description: 'low' },
+    { id: 'high', description: 'high' },
+  ])
+  assert.equal(models[0]?.defaultReasoningEffort, 'high')
+  assert.equal(models[0]?.source, 'discovered')
+})

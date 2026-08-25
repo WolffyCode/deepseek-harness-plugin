@@ -103,6 +103,17 @@ export class CodexRuntime {
     await this.transport.notify('initialized')
   }
 
+  async listModels(options: { readonly includeHidden?: boolean; readonly limit?: number } = {}, signal?: AbortSignal): Promise<readonly JsonObject[]> {
+    const response = await this.transport.request('model/list', {
+      includeHidden: options.includeHidden ?? true,
+      ...options.limit === undefined ? {} : { limit: options.limit },
+    }, signal)
+    const root = object(response, 'model/list response')
+    const data = root['data']
+    if (!Array.isArray(data)) throw new Error('model/list response.data must be an array')
+    return data.map((entry, index) => object(entry, `model/list response.data[${index}]`))
+  }
+
   async startThread(signal?: AbortSignal): Promise<CodexThread> {
     const response = await this.transport.request('thread/start', {
       cwd: this.options.cwd,

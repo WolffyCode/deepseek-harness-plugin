@@ -1,5 +1,7 @@
 import type { EngineDefinition } from './engine/types.js'
+import type { ModelRecord } from './model/types.js'
 import { openCodexLaunch, type CodexLaunch, type CodexLaunchOptions } from './codex/launch.js'
+import { discoverCodexModels, type CodexModelDiscoveryOptions } from './codex/discovery.js'
 import { EngineRegistry, ModelCatalog, ProviderRegistry } from './registry.js'
 import { resolveEngineProfile } from './profile/resolver.js'
 import type { EngineProfileSnapshot, EngineSelection } from './profile/types.js'
@@ -38,6 +40,7 @@ export interface EngineSuite {
   readonly models: ModelCatalog
   resolveProfile(selection: EngineSelection): EngineProfileSnapshot
   openCodex(selection: EngineSelection, options: Omit<CodexLaunchOptions, 'profile' | 'provider' | 'model'>): Promise<CodexLaunch>
+  discoverCodexModels(providerId: string, options: Omit<CodexModelDiscoveryOptions, 'provider'>): Promise<readonly ModelRecord[]>
 }
 
 export function createEngineSuite(): EngineSuite {
@@ -50,6 +53,12 @@ export function createEngineSuite(): EngineSuite {
     providers,
     models,
     resolveProfile: selection => resolveEngineProfile({ engines, providers, models }, selection),
+    discoverCodexModels: async (providerId, options) => {
+      const provider = providers.get(providerId)
+      const discovered = await discoverCodexModels({ ...options, provider })
+      models.replaceProvider(providerId, discovered)
+      return discovered
+    },
     openCodex: async (selection, options) => {
       const profile = resolveEngineProfile({ engines, providers, models }, selection)
       return openCodexLaunch({
@@ -70,3 +79,4 @@ export * from './plugin.js'
 export * from './agent/external-codex-agent.js'
 export * from './agent/service.js'
 export * from './settings.js'
+export * from './codex/discovery.js'

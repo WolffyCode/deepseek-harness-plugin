@@ -63,4 +63,15 @@ export class ModelCatalog {
   list(providerId?: ProviderId): readonly ModelRecord[] {
     return [...this.models.values()].filter(model => providerId === undefined || model.providerId === providerId)
   }
+
+  replaceProvider(providerId: ProviderId, models: readonly ModelRecord[]): void {
+    for (const [id, model] of this.models) {
+      if (model.providerId === providerId) this.models.delete(id)
+    }
+    for (const model of models) {
+      if (model.providerId !== providerId) throw new Error(`model ${model.id} does not belong to provider ${providerId}`)
+      if (this.models.has(model.id)) throw new Error(`model already registered: ${model.id}`)
+      this.models.set(model.id, model)
+    }
+  }
 }

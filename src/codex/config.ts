@@ -30,6 +30,40 @@ function providerKey(value: string): string {
 }
 
 /** Render the minimal Codex provider config without embedding an API key. */
+
+export interface CodexProviderConfigMaterialization {
+  readonly configToml: string
+  readonly modelProvider: string
+  readonly environment: Readonly<Record<string, string>>
+  readonly redactions: readonly string[]
+}
+
+export function renderCodexProviderConfig(input: {
+  readonly providerName: string
+  readonly baseUri: string
+  readonly apiKey: string
+}): CodexProviderConfigMaterialization {
+  const providerName = nonEmpty(input.providerName, 'provider name')
+  const baseUri = normalizeBaseUri(input.baseUri)
+  const apiKey = nonEmpty(input.apiKey, 'API key')
+  const providerKeyName = providerKey(providerName)
+  return {
+    configToml: [
+      `model_provider = ${tomlString(providerKeyName)}`,
+      '',
+      `[model_providers.${providerKeyName}]`,
+      `name = ${tomlString(providerName)}`,
+      `base_url = ${tomlString(baseUri)}`,
+      'wire_api = "responses"',
+      'requires_openai_auth = true',
+      '',
+    ].join('\n'),
+    modelProvider: providerKeyName,
+    environment: { OPENAI_API_KEY: apiKey },
+    redactions: [apiKey],
+  }
+}
+
 export function renderCodexConfig(input: CodexProviderRuntimeConfig): CodexConfigMaterialization {
   const providerName = nonEmpty(input.providerName, 'provider name')
   const baseUri = normalizeBaseUri(input.baseUri)
