@@ -15,9 +15,10 @@ This repository currently contains the first domain foundation only:
 - Model catalog records and model-specific reasoning options.
 - Versioned EngineProfile resolution.
 - A local-only Codex debug-provider seed reader.
+- Codex app-server JSON-RPC transport, process lifecycle, and launch config materialization.
 
-The Codex process transport and Harness/Cordis integration are deliberately not included in this
-first foundation step. They will be added after the profile and lifecycle contracts are tested.
+Harness/Cordis integration is deliberately not included yet. The next step is to bind this tested
+Codex runtime to the Harness Agent/Session and plugin lifecycle contracts.
 
 ## Development
 
