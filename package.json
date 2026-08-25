@@ -1,0 +1,31 @@
+{
+  "name": "@wolffycode/dsh-engine-suite",
+  "version": "0.1.0",
+  "description": "A single-install DeepSeek Harness plugin for multi-engine Agent runtimes",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/WolffyCode/deepseek-harness-plugin.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "@types/node": "^22.18.6"
+  }
+}
