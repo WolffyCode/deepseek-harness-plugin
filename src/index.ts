@@ -1,4 +1,5 @@
 import type { EngineDefinition } from './engine/types.js'
+import { openCodexLaunch, type CodexLaunch, type CodexLaunchOptions } from './codex/launch.js'
 import { EngineRegistry, ModelCatalog, ProviderRegistry } from './registry.js'
 import { resolveEngineProfile } from './profile/resolver.js'
 import type { EngineProfileSnapshot, EngineSelection } from './profile/types.js'
@@ -36,6 +37,7 @@ export interface EngineSuite {
   readonly providers: ProviderRegistry
   readonly models: ModelCatalog
   resolveProfile(selection: EngineSelection): EngineProfileSnapshot
+  openCodex(selection: EngineSelection, options: Omit<CodexLaunchOptions, 'profile' | 'provider' | 'model'>): Promise<CodexLaunch>
 }
 
 export function createEngineSuite(): EngineSuite {
@@ -48,9 +50,19 @@ export function createEngineSuite(): EngineSuite {
     providers,
     models,
     resolveProfile: selection => resolveEngineProfile({ engines, providers, models }, selection),
+    openCodex: async (selection, options) => {
+      const profile = resolveEngineProfile({ engines, providers, models }, selection)
+      return openCodexLaunch({
+        ...options,
+        profile,
+        provider: providers.get(profile.providerId),
+        model: models.get(profile.modelRecordId),
+      })
+    },
   }
 }
 export * from './codex/json-rpc.js'
 export * from './codex/process.js'
 export * from './codex/runtime.js'
 export * from './codex/config.js'
+export * from './codex/launch.js'

@@ -93,3 +93,46 @@ test('Codex config materialization keeps the API key out of config.toml', async 
   assert.equal(materialized.environment['OPENAI_API_KEY'], 'secret-api-key')
   assert.deepEqual(materialized.redactions, ['secret-api-key'])
 })
+
+test('EngineSuite opens an isolated Codex launch from a resolved profile', async () => {
+  const { createEngineSuite } = await import('../src/index.js')
+  const suite = createEngineSuite()
+  suite.providers.register({
+    id: 'launch-provider',
+    engineId: 'codex-cli',
+    name: 'Launch Provider',
+    baseUri: 'https://example.test',
+    credentialRef: 'launch-credential',
+  })
+  suite.models.register({
+    id: 'launch-model',
+    engineId: 'codex-cli',
+    providerId: 'launch-provider',
+    modelId: 'gpt-test',
+    reasoningOptions: [{ id: 'high' }],
+    source: 'manual',
+  })
+  const script = [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n');",
+    "else if(m.method==='thread/start') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{thread:{id:'launch-thread',ephemeral:false}}})+'\\n');",
+    "});",
+  ].join('')
+  const launch = await suite.openCodex({
+    engineId: 'codex-cli',
+    providerId: 'launch-provider',
+    modelRecordId: 'launch-model',
+    reasoningEffort: 'high',
+  }, {
+    apiKey: 'launch-secret',
+    cwd: process.cwd(),
+    executable: process.execPath,
+    args: ['-e', script],
+    disposeGraceMs: 100,
+  })
+  assert.equal(launch.runtime.threadId, 'launch-thread')
+  assert.equal(launch.profile.reasoningEffort, 'high')
+  assert.match(launch.codexHome, /codex-home$/)
+  await launch.close()
+})

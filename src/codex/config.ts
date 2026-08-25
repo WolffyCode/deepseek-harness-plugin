@@ -9,6 +9,7 @@ export interface CodexProviderRuntimeConfig {
 
 export interface CodexConfigMaterialization {
   readonly configToml: string
+  readonly modelProvider: string
   readonly environment: Readonly<Record<string, string>>
   readonly redactions: readonly string[]
 }
@@ -48,6 +49,7 @@ export function renderCodexConfig(input: CodexProviderRuntimeConfig): CodexConfi
   ].join('\n')
   return {
     configToml,
+    modelProvider: providerKeyName,
     environment: { OPENAI_API_KEY: apiKey },
     redactions: [apiKey],
   }
