@@ -24,6 +24,7 @@ npm run typecheck
 npm test
 npm run build
 pnpm test
+pnpm pack --dry-run
 git diff --check
 ```
 
@@ -55,4 +56,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-缺少真实 Claude 前置时，完整 `npm test` 的结果是 **135 tests / 134 pass / 1 external skip**；这个 skip 是外部前置的显式结果，不是被测试逻辑掩盖的失败。
+缺少真实 Claude 前置时，完整 `npm test` 的结果是 **139 tests / 138 pass / 1 external skip**；这个 skip 是外部前置的显式结果，不是被测试逻辑掩盖的失败。

@@ -12,6 +12,7 @@ test('EngineSuite Claude has one ProviderSession implementation and no legacy ru
   const engineSuiteSource = await readFile(new URL('engine-suite.ts', sourceRoot), 'utf8')
   const adapterSource = await readFile(new URL('claude/adapter.ts', sourceRoot), 'utf8')
   const sessionSource = await readFile(new URL('claude/session.ts', sourceRoot), 'utf8')
+  const processSource = await readFile(new URL('claude/process.ts', sourceRoot), 'utf8')
 
   assert.match(engineSuiteSource, /createClaudeProviderSession/)
   assert.match(engineSuiteSource, /ClaudeSessionRuntimeBridge/)
@@ -19,9 +20,10 @@ test('EngineSuite Claude has one ProviderSession implementation and no legacy ru
   assert.doesNotMatch(engineSuiteSource, /ClaudeRuntime|openClaudeLaunch/)
   assert.match(adapterSource, /new ClaudeProviderSession/)
   assert.match(sessionSource, /new ClaudeSdkTransport/)
+  assert.match(sessionSource, /ClaudeProcess\.start/)
+  assert.match(processSource, /detached: process\.platform !== 'win32'/)
 
   await assertMissing('claude/runtime.ts')
   await assertMissing('claude/launch.ts')
-  await assertMissing('claude/process.ts')
-  assert.doesNotMatch(sessionSource, /ClaudeProcess|from ['"]\.\/process/)
+  assert.doesNotMatch(sessionSource, /ClaudeRuntime|openClaudeLaunch/)
 })

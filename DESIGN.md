@@ -37,7 +37,7 @@ Harness 负责 Session 持久事件、Workspace、权限、Agent 生命周期和
 
 ## Claude/GLM
 
-Claude 通过 SDK query 使用 `claude -p` 的 stream-json 能力。启动参数由 `src/claude/session.ts` 和 `src/claude/transport.ts` 组织，包含 bare、stream input/output、partial message、model 和 effort；权限由 `src/claude/control.ts` 转到 Harness Approval。
+Claude 通过 SDK query 使用 `claude -p` 的 stream-json 能力。启动参数由 `src/claude/session.ts` 和 `src/claude/transport.ts` 组织，`src/claude/process.ts` 负责按 SDK 提供的完整环境启动子进程、截断并脱敏 stderr，以及在取消和关闭时回收整个进程组；参数包含 bare、stream input/output、partial message、model 和 effort；权限由 `src/claude/control.ts` 转到 Harness Approval。
 
 Provider 只以 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 和内存 credential 组成当前进程环境。Harness prompt、tool schema、Harness/cross-engine agent map 不进入 Claude SDK options。用户显式 Claude agent 定义必须通过 opt-in wrapper。
 
@@ -74,9 +74,10 @@ npm run typecheck
 npm test
 npm run build
 pnpm test
+pnpm pack --dry-run
 git diff --check
 ```
 
-截至 2026-08-26 的真实基线是：`npm run typecheck` 通过；`npm test` 和 `pnpm test` 均为 **135 tests / 134 pass / 1 external skip**；`npm run build` 通过，并生成可发布的 Host、Remote、client bundle 与 client declaration artifacts。外部 skip 是真实 Claude E2E：它需要 Claude-compatible endpoint、认证环境变量、可执行的本地 `claude` CLI 和 GLM model；缺少任一前置时 skip 是显式结果，不得改成无条件通过。
+截至 2026-08-26 的真实基线是：`npm run typecheck` 通过；`npm test` 和 `pnpm test` 均为 **139 tests / 138 pass / 1 external skip**；`npm run build` 通过，并生成可发布的 Host、Remote、client bundle 与 client declaration artifacts。外部 skip 是真实 Claude E2E：它需要 Claude-compatible endpoint、认证环境变量、可执行的本地 `claude` CLI 和 GLM model；缺少任一前置时 skip 是显式结果，不得改成无条件通过。
 
 pnpm 的独立仓库修复、依赖版本选择和 Typert generator 发布依赖见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。

@@ -3,7 +3,7 @@
 - **审计日期**：2026-08-26
 - **范围**：只描述本插件仓库 `/Users/zhuanzmima0000/Desktop/coding/person/deepseek-harness/deepseek-harness-plugin` 的当前实现与测试，不描述 `deepseek-harness` 源码。
 - **发布结论**：当前可发布能力是 **GLM/Codex-only**：`claude-cli` 只允许 GLM 模型，`codex-cli` 使用 Codex app-server；Claude Opus 被过滤并在会话创建、模型切换和真实 E2E 前拒绝。
-- **当前实现位置**：Claude 代码位于 `src/claude/{adapter,catalog,commands,control,mcp,persistence,requests,rewind,session,skills,subagents,transport,types}.ts`。仓库中不存在也不应再引用 `src/claude/launch.ts` 或 `src/claude/runtime.ts`；通用外部引擎事件与桥接位于 `src/agent/`。
+- **当前实现位置**：Claude 代码位于 `src/claude/{adapter,catalog,commands,control,mcp,persistence,process,requests,rewind,session,skills,subagents,transport,types}.ts`。仓库中不存在也不应再引用 `src/claude/launch.ts` 或 `src/claude/runtime.ts`；通用外部引擎事件与桥接位于 `src/agent/`。
 
 ## 当前架构
 
@@ -27,6 +27,7 @@ Harness 继续拥有 Session、Workspace、持久事件、Agent 生命周期和 
 | --- | --- | --- |
 | Claude 初始化与会话 | 等待真实 `system/init` 后暴露 native session id；支持 resume、close、事件缓冲和订阅先于启动 | `tests/claude-foundation.test.ts`、`tests/claude-session.test.ts`、`tests/claude-transport.test.ts` |
 | Claude 流与工具 | 归一化文本、tool call、tool result、result/error，并把权限请求交给 Harness Approval | `tests/claude-integration.test.ts`、`tests/claude-control.test.ts` |
+| Claude 进程生命周期 | 使用 SDK 完整环境启动 CLI，隔离父进程环境，脱敏并限制 stderr 尾部，关闭/取消时回收进程组 | `tests/claude-process.test.ts` |
 | Claude catalog/命令 | 映射 SDK command/model；缓存、失效、分页错误和 slash 原始输入均有测试 | `tests/claude-catalog.test.ts`、`tests/claude-commands.test.ts` |
 | Claude MCP/Skill/历史 | 用户资产使用 SDK 原生配置；credentialRef 由宿主解析；历史、导入、归档和 rewind 使用插件自有 native handle | `tests/claude-mcp.test.ts`、`tests/claude-skills.test.ts`、`tests/claude-persistence.test.ts`、`tests/claude-rewind.test.ts` |
 | Codex | JSON-RPC、initialize、thread start/resume、turn、通知、权限、配置脱敏、模型发现和隔离 runtime 已覆盖 | `tests/codex-runtime.test.ts`、`tests/codex-requests.test.ts`、`tests/codex-model-policy.test.ts` |

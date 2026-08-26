@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import {
   type AgentDefinition,
   type CanUseTool,
@@ -12,9 +11,9 @@ import {
   type SDKMessage,
   type Options as ClaudeSdkOptions,
   type SpawnOptions,
-  type SpawnedProcess,
 } from '@anthropic-ai/claude-agent-sdk'
 import { ClaudeCredentialRedactor, ClaudeSdkTransport, type ClaudeTransportEvent } from './transport.js'
+import { ClaudeProcess, claudeProcessRedactions } from './process.js'
 import type {
   ClaudeAdapterEvent,
   ClaudeAdapterOptions,
@@ -809,12 +808,11 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       ...(this.options.thinking === undefined ? {} : { thinking: this.options.thinking }),
       ...(this.options.permissionMode === undefined ? {} : { permissionMode: this.options.permissionMode }),
       ...(this.options.executablePath === undefined ? {} : { pathToClaudeCodeExecutable: this.options.executablePath }),
-      ...((this.options.executablePath === undefined && this.options.commandArgs === undefined) ? {} : {
-        spawnClaudeCodeProcess: (spawnOptions: SpawnOptions): SpawnedProcess => spawn(
-          this.options.executablePath ?? spawnOptions.command,
-          this.options.commandArgs ?? spawnOptions.args,
-          { cwd: spawnOptions.cwd, env: spawnOptions.env, signal: spawnOptions.signal, shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
-        ),
+      spawnClaudeCodeProcess: (spawnOptions: SpawnOptions) => ClaudeProcess.start({
+        ...spawnOptions,
+        command: this.options.executablePath ?? spawnOptions.command,
+        args: [...this.options.commandArgs ?? spawnOptions.args],
+        redactions: claudeProcessRedactions(this.options),
       }),
       ...(additionalDirectories === undefined ? {} : { additionalDirectories: [...additionalDirectories] }),
       ...(mcpServers === undefined ? {} : { mcpServers: { ...mcpServers } }),
