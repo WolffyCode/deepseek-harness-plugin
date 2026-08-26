@@ -5,3 +5,8 @@ dist/
 !.env.example
 .DS_Store
 coverage/
+
+# Local UI and E2E evidence
+evidence-*.json
+evidence-*.png
+*.tsbuildinfo

@@ -91,3 +91,23 @@ test('bundle entry publishes one EngineSuite service', async () => {
   const providedValue = ctx.get('engineSuite')
   assert.ok(providedValue !== undefined)
 })
+
+test('profile settings bind child policy and runtime Skill/MCP assets without credentials', async () => {
+  const { syncEngineSuiteSettings } = await import('../src/settings.js')
+  const suite = createEngineSuite()
+  suite.providers.register({ id: 'profile-provider', engineId: 'codex-cli', name: 'Profile Provider', baseUri: 'https://example.test', credentialRef: 'profile-credential' })
+  suite.models.register({ id: 'profile-model', engineId: 'codex-cli', providerId: 'profile-provider', modelId: 'profile-model', reasoningOptions: [{ id: 'low' }], source: 'manual' })
+  syncEngineSuiteSettings(suite as never, {
+    providers: [{ id: 'profile-provider', engineId: 'codex-cli', name: 'Profile Provider', baseUri: 'https://example.test', credentialRef: 'profile-credential', wireApi: 'responses', authMode: 'api-key', enabled: true }],
+    models: [{ id: 'profile-model', engineId: 'codex-cli', providerId: 'profile-provider', modelId: 'profile-model', enabled: true, hidden: false, reasoningOptions: ['low'], contextWindowSource: 'unknown' }],
+    profiles: [{ id: 'parent-policy', engineId: 'codex-cli', providerId: 'profile-provider', modelRecordId: 'profile-model', reasoningEffort: 'low', allowedChildProfiles: ['native-child'], maxChildDepth: 2, maxConcurrentChildren: 3, enabled: true }],
+    skillSets: [{ id: 'skills', pluginDirs: ['/tmp/skills'], additionalDirectories: [] }],
+    mcpSets: [{ id: 'mcp', servers: [{ id: 'server', name: 'Server', transport: 'stdio', command: 'node', args: [] }] }],
+  })
+  const profile = suite.resolveProfile({ engineId: 'codex-cli', providerId: 'profile-provider', modelRecordId: 'profile-model', reasoningEffort: 'low' })
+  assert.equal(profile.id, 'parent-policy')
+  assert.deepEqual(profile.allowedChildProfiles, ['native-child'])
+  assert.equal(profile.maxChildDepth, 2)
+  assert.equal(suite.assets.skillSet('skills').pluginDirs[0], '/tmp/skills')
+  assert.equal(suite.assets.mcpSet('mcp').servers[0]?.id, 'server')
+})

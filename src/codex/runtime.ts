@@ -1,4 +1,5 @@
-import type { JsonObject, JsonRpcLineTransport, JsonValue } from './json-rpc.js'
+import type { JsonObject, JsonRpcLineTransport, JsonRpcRequestHandler, JsonValue } from './json-rpc.js'
+import type { ExternalEngineEvent, ExternalEngineEventHandler } from '../agent/runtime.js'
 import { JsonRpcLineTransport as LineTransport } from './json-rpc.js'
 import { CodexProcess, type CodexProcessOptions, type ProcessExit } from './process.js'
 
@@ -10,6 +11,7 @@ export interface CodexRuntimeOptions extends CodexProcessOptions {
   readonly ephemeral?: boolean
   readonly approvalPolicy?: JsonValue
   readonly sandbox?: JsonValue
+  readonly serverRequestHandler?: JsonRpcRequestHandler
 }
 
 export interface CodexThread {
@@ -48,6 +50,68 @@ function turnFrom(value: JsonValue): CodexTurn {
   return { id: string(turn['id'], 'turn id') }
 }
 
+
+function stringField(value: JsonValue | undefined): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function serialized(value: JsonValue | undefined): string {
+  if (typeof value === 'string') return value
+  if (value === undefined) return ''
+  return JSON.stringify(value)
+}
+
+function toolCallFromItem(item: JsonObject): { readonly id: string; readonly name: string; readonly arguments: string } | undefined {
+  const id = stringField(item['id'])
+  if (id === undefined) return undefined
+  const type = stringField(item['type'])
+  if (type === 'commandExecution') {
+    return { id, name: 'command_execution', arguments: JSON.stringify({ command: item['command'] ?? '' }) }
+  }
+  if (type === 'fileChange') {
+    return { id, name: 'file_change', arguments: JSON.stringify({ changes: item['changes'] ?? item['patch'] ?? [] }) }
+  }
+  if (type === 'mcpToolCall') {
+    return {
+      id,
+      name: stringField(item['tool']) ?? 'mcp_tool',
+      arguments: serialized(item['arguments'] ?? item['input'] ?? {}),
+    }
+  }
+  if (type === 'webSearch') {
+    return { id, name: 'web_search', arguments: serialized(item['query'] ?? item['input'] ?? {}) }
+  }
+  if (type === 'computerCall' || type === 'computer_call') {
+    return { id, name: 'computer', arguments: serialized(item['action'] ?? item['input'] ?? item) }
+  }
+  return undefined
+}
+
+function toolResultFromItem(item: JsonObject): { readonly id: string; readonly output: string; readonly isError: boolean } | undefined {
+  const id = stringField(item['id'])
+  if (id === undefined) return undefined
+  const status = stringField(item['status'])
+  const isError = status === 'failed' || status === 'declined' || status === 'error' || item['isError'] === true
+  const output = item['aggregatedOutput'] ?? item['output'] ?? item['stdout'] ?? item['stderr'] ?? item['result'] ?? item['changes'] ?? item['patch']
+  return { id, output: serialized(output ?? item), isError }
+}
+
+function defaultServerRequestHandler(method: string): JsonValue {
+  switch (method) {
+    case 'item/commandExecution/requestApproval':
+    case 'item/fileChange/requestApproval':
+      return { decision: 'decline' }
+    case 'item/permissions/requestApproval':
+      return { permissions: {}, scope: 'turn' }
+    case 'item/tool/requestUserInput':
+      return { answers: {} }
+    case 'mcpServer/elicitation/request':
+      return { action: 'decline', content: null, _meta: null }
+    default:
+      throw new Error(`unsupported Codex app-server request: ${method}`)
+  }
+}
+
 /** Codex app-server lifecycle for one Harness Agent. */
 export class CodexRuntime {
   readonly process: CodexProcess
@@ -55,6 +119,7 @@ export class CodexRuntime {
   private thread: CodexThread | undefined
   private turn: CodexTurn | undefined
   private closed = false
+  private readonly eventListeners = new Set<ExternalEngineEventHandler>()
 
   private constructor(
     process: CodexProcess,
@@ -63,6 +128,8 @@ export class CodexRuntime {
   ) {
     this.process = process
     this.transport = transport
+    this.transport.onRequest(options.serverRequestHandler ?? defaultServerRequestHandler)
+    this.transport.onNotification((method, params) => this.handleNotification(method, params))
   }
 
   static async open(options: CodexRuntimeOptions): Promise<CodexRuntime> {
@@ -86,6 +153,59 @@ export class CodexRuntime {
 
   get turnId(): string | undefined {
     return this.turn?.id
+  }
+
+  onEvent(handler: ExternalEngineEventHandler): () => void {
+    this.eventListeners.add(handler)
+    return () => this.eventListeners.delete(handler)
+  }
+
+  private emit(event: ExternalEngineEvent): void {
+    for (const listener of [...this.eventListeners]) listener(event)
+  }
+
+  private handleNotification(method: string, rawParams: JsonValue | undefined): void {
+    const params = typeof rawParams === 'object' && rawParams !== null && !Array.isArray(rawParams)
+      ? rawParams as JsonObject
+      : undefined
+    const eventTurnId = stringField(params?.['turnId'])
+    if (method === 'item/agentMessage/delta') {
+      const delta = stringField(params?.['delta'])
+      if (delta !== undefined) this.emit({ type: 'text-delta', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, text: delta })
+      return
+    }
+    if (method === 'item/started') {
+      const item = typeof params?.['item'] === 'object' && params['item'] !== null && !Array.isArray(params['item'])
+        ? params['item'] as JsonObject
+        : undefined
+      if (item === undefined) return
+      const tool = toolCallFromItem(item)
+      if (tool !== undefined) this.emit({ type: 'tool-call', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, ...tool })
+      return
+    }
+    if (method === 'item/completed') {
+      const item = typeof params?.['item'] === 'object' && params['item'] !== null && !Array.isArray(params['item'])
+        ? params['item'] as JsonObject
+        : undefined
+      if (item === undefined) return
+      if (toolCallFromItem(item) === undefined) return
+      const result = toolResultFromItem(item)
+      if (result !== undefined) this.emit({ type: 'tool-result', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, ...result })
+      return
+    }
+    if (method === 'turn/completed') {
+      const turn = typeof params?.['turn'] === 'object' && params['turn'] !== null && !Array.isArray(params['turn'])
+        ? params['turn'] as JsonObject
+        : undefined
+      const status = stringField(turn?.['status'])
+      const error = serialized(turn?.['error'])
+      this.emit({
+        type: 'turn-completed',
+        ...eventTurnId === undefined ? {} : { turnId: eventTurnId },
+        status: status === 'completed' ? 'completed' : 'failed',
+        ...status === 'completed' || error.length === 0 ? {} : { error },
+      })
+    }
   }
 
   async initialize(signal?: AbortSignal): Promise<void> {

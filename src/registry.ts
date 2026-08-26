@@ -33,6 +33,17 @@ export class ProviderRegistry {
     return provider
   }
 
+  replaceAll(inputs: readonly CreateProviderInput[]): void {
+    const next = inputs.map(createProvider)
+    const ids = new Set<ProviderId>()
+    for (const provider of next) {
+      if (ids.has(provider.id)) throw new Error(`provider already registered: ${provider.id}`)
+      ids.add(provider.id)
+    }
+    this.providers.clear()
+    for (const provider of next) this.providers.set(provider.id, provider)
+  }
+
   get(id: ProviderId): EngineProvider {
     const provider = this.providers.get(id)
     if (provider === undefined) throw new Error(`unknown provider: ${id}`)
@@ -52,6 +63,17 @@ export class ModelCatalog {
     if (this.models.has(model.id)) throw new Error(`model already registered: ${model.id}`)
     this.models.set(model.id, model)
     return model
+  }
+
+  replaceAll(inputs: readonly CreateModelInput[]): void {
+    const next = inputs.map(createModel)
+    const ids = new Set<ModelRecordId>()
+    for (const model of next) {
+      if (ids.has(model.id)) throw new Error(`model already registered: ${model.id}`)
+      ids.add(model.id)
+    }
+    this.models.clear()
+    for (const model of next) this.models.set(model.id, model)
   }
 
   get(id: ModelRecordId): ModelRecord {

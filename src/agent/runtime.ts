@@ -344,7 +344,126 @@ export interface ExternalEngineRuntime {
   readonly process: { readonly exited: Promise<unknown>; readonly stderrTail: string };
   readonly turnId: string | undefined;
   onEvent(handler: ExternalEngineEventHandler): () => void;
+  /** Optional provider readiness gate; Claude exposes it to await SDK initialization. */
+  whenReady?(): Promise<void>;
   startTurn(text: string, signal?: AbortSignal): Promise<{ readonly id: string }>;
   interrupt(signal?: AbortSignal): Promise<unknown>;
   close(): Promise<unknown>;
+}
+
+import type { ClaudeAdapterEvent, ClaudeAgentSession, ClaudeAdapterOptions, ClaudeThinkingOption, ClaudeTimelineItem, ClaudeUsage, ClaudePermissionRequest } from "../claude/types.js";
+
+/** Adapts the native Claude session to the Harness external-engine runtime contract. */
+function toUsage(value: ClaudeUsage): AgentUsage {
+  const usage: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalCostUsd?: number; contextWindowMaxTokens?: number; contextWindowUsedTokens?: number } = {};
+  if (typeof value.inputTokens === "number") usage.inputTokens = value.inputTokens;
+  if (typeof value.cachedInputTokens === "number") usage.cachedInputTokens = value.cachedInputTokens;
+  if (typeof value.outputTokens === "number") usage.outputTokens = value.outputTokens;
+  if (typeof value.totalCostUsd === "number") usage.totalCostUsd = value.totalCostUsd;
+  if (typeof value.contextWindowMaxTokens === "number") usage.contextWindowMaxTokens = value.contextWindowMaxTokens;
+  if (typeof value.contextWindowUsedTokens === "number") usage.contextWindowUsedTokens = value.contextWindowUsedTokens;
+  return usage;
+}
+
+function toPermission(request: ClaudePermissionRequest): AgentPermissionRequest {
+  return {
+    id: request.requestId,
+    kind: "tool",
+    name: request.toolName,
+    input: request.input,
+    ...(request.title === undefined ? {} : { title: request.title }),
+    ...(request.description === undefined ? {} : { description: request.description }),
+  };
+}
+
+export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
+  readonly process = { exited: Promise.resolve(undefined), stderrTail: "" };
+  private readonly listeners = new Set<ExternalEngineEventHandler>();
+  private readonly unsubscribe: () => void;
+  private activeTurnId: string | undefined;
+  private interruptTurnId: string | undefined;
+  private interruptPromise: Promise<void> | undefined;
+  private closed = false;
+
+  constructor(readonly session: ClaudeAgentSession) {
+    this.unsubscribe = session.subscribe(event => {
+      if (event.type === "turn_started") {
+        this.activeTurnId = event.turnId;
+        this.interruptTurnId = undefined;
+        this.interruptPromise = undefined;
+      }
+      const projected = this.project(event);
+      if (projected !== undefined) for (const listener of [...this.listeners]) listener(projected);
+      if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_canceled") {
+        if (event.turnId === undefined || event.turnId === this.activeTurnId) {
+          this.activeTurnId = undefined;
+        }
+      }
+    });
+  }
+
+  get turnId(): string | undefined { return this.activeTurnId; }
+
+  whenReady(): Promise<void> { return this.session.whenReady?.() ?? Promise.resolve(); }
+
+  onEvent(handler: ExternalEngineEventHandler): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
+
+  async startTurn(text: string, _signal?: AbortSignal): Promise<{ readonly id: string }> {
+    const result = await this.session.startTurn(text);
+    this.activeTurnId = result.turnId;
+    this.interruptTurnId = undefined;
+    this.interruptPromise = undefined;
+    return { id: result.turnId };
+  }
+
+  async interrupt(_signal?: AbortSignal): Promise<void> {
+    if (this.closed || this.activeTurnId === undefined) return;
+    if (this.interruptTurnId === this.activeTurnId && this.interruptPromise !== undefined) {
+      await this.interruptPromise;
+      return;
+    }
+    const turnId = this.activeTurnId;
+    this.interruptTurnId = turnId;
+    this.interruptPromise = this.session.interrupt();
+    await this.interruptPromise;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.unsubscribe();
+    await this.session.close();
+  }
+
+  private project(event: ClaudeAdapterEvent): AgentStreamEvent | undefined {
+    const provider = "claude-cli" as AgentProvider;
+    switch (event.type) {
+      case "session_started": return { type: "thread_started", provider, sessionId: event.sessionId };
+      case "turn_started": return { type: "turn_started", provider, turnId: event.turnId };
+      case "timeline": return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item: this.timeline(event.item) };
+      case "usage_updated": return { type: "usage_updated", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), usage: toUsage(event.usage) };
+      case "permission_requested": return { type: "permission_requested", provider, request: toPermission(event.request) };
+      case "status_changed": return { type: "error", provider, error: event.status };
+      case "turn_completed": return { type: "turn_completed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), ...(event.usage === undefined ? {} : { usage: toUsage(event.usage) }) };
+      case "turn_failed": return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error };
+      case "turn_canceled": return { type: "turn_canceled", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), reason: "canceled" };
+      default: return undefined;
+    }
+  }
+
+  private timeline(item: ClaudeTimelineItem): AgentTimelineItem {
+    const value = item as { type: string; id?: string; text?: string; name?: string; arguments?: string; output?: string; isError?: boolean; partial?: boolean; metadata?: Record<string, unknown> };
+    if (value.type === "tool_call" || value.type === "tool_result") {
+      let input: unknown = value.arguments;
+      if (typeof value.arguments === "string") { try { input = JSON.parse(value.arguments); } catch { input = value.arguments; } }
+      return { type: "tool_call", id: value.id ?? "", name: value.name ?? "external_tool", status: value.type === "tool_result" ? (value.isError ? "failed" : "completed") : "running", ...(input === undefined ? {} : { input }), ...(value.output === undefined ? {} : { output: value.output }) };
+    }
+    if (value.type === "reasoning") return { type: "reasoning", text: value.text ?? "" };
+    if (value.type === "compaction") return { type: "compaction", status: "completed" };
+    if (value.type === "status") return { type: "error", message: value.text ?? "" };
+    return { type: "assistant_message", text: value.text ?? "", ...(value.partial === undefined ? {} : { partial: value.partial }) };
+  }
 }

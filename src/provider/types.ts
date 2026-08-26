@@ -3,8 +3,8 @@ import type { EngineId } from '../engine/types.js'
 export type ProviderId = string
 export type CredentialRef = string
 export type ProviderStatus = 'unknown' | 'testing' | 'available' | 'rejected' | 'failed'
-export type ProviderWireApi = 'responses'
-export type ProviderAuthMode = 'api-key'
+export type ProviderWireApi = 'responses' | 'anthropic'
+export type ProviderAuthMode = 'api-key' | 'auth-token'
 
 export interface EngineProvider {
   readonly id: ProviderId
@@ -28,6 +28,7 @@ export interface CreateProviderInput {
   readonly credentialRef: CredentialRef
   readonly wireApi?: ProviderWireApi
   readonly authMode?: ProviderAuthMode
+  readonly enabled?: boolean
 }
 
 export function normalizeBaseUri(baseUri: string): string {
@@ -52,11 +53,16 @@ export function createProvider(input: CreateProviderInput): EngineProvider {
   if (id.length === 0) throw new Error('provider id must not be empty')
   if (name.length === 0) throw new Error('provider name must not be empty')
   if (credentialRef.length === 0) throw new Error('provider credential reference must not be empty')
-  if (input.wireApi !== undefined && input.wireApi !== 'responses') {
-    throw new Error('Codex v1 supports only the Responses API wire protocol')
+  const wireApi = input.wireApi ?? (input.engineId === 'claude-cli' ? 'anthropic' : 'responses')
+  const authMode = input.authMode ?? (input.engineId === 'claude-cli' ? 'auth-token' : 'api-key')
+  if (input.engineId === 'codex-cli' && wireApi !== 'responses') {
+    throw new Error('Codex CLI requires the Responses API wire protocol')
   }
-  if (input.authMode !== undefined && input.authMode !== 'api-key') {
-    throw new Error('Codex v1 supports only API-key authentication')
+  if (input.engineId === 'claude-cli' && wireApi !== 'anthropic') {
+    throw new Error('Claude CLI requires the Anthropic wire protocol')
+  }
+  if (authMode !== 'api-key' && authMode !== 'auth-token') {
+    throw new Error('unsupported provider authentication mode')
   }
   return {
     id,
@@ -64,9 +70,9 @@ export function createProvider(input: CreateProviderInput): EngineProvider {
     name,
     baseUri: normalizeBaseUri(input.baseUri),
     credentialRef,
-    wireApi: 'responses',
-    authMode: 'api-key',
-    enabled: true,
+    wireApi,
+    authMode,
+    enabled: input.enabled ?? true,
     status: 'unknown',
   }
 }

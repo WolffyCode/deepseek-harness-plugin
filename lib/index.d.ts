@@ -1,15 +1,20 @@
 export { createEngineSuite, CODEX_ENGINE } from './engine-suite.js';
-export type { EngineSuite, OpenCodexOptions, DiscoverCodexModelsOptions } from './engine-suite.js';
+export type { EngineSuite, OpenEngineOptions, OpenCodexOptions, DiscoverCodexModelsOptions } from './engine-suite.js';
 export * from './debug-provider.js';
 export * from './engine/types.js';
+export * from './assets.js';
 export * from './model/types.js';
 export * from './profile/types.js';
+export * from './profile/catalog.js';
 export * from './provider/types.js';
+export type * from './types.js';
 export * from './profile/resolver.js';
 export * from './registry.js';
 export * from './settings.js';
-export { apply } from './plugin.js';
-export type { EngineSuiteService } from './plugin.js';
+export { apply, inject } from './plugin.js';
+export type { EngineSuitePluginConfig, EngineSuiteService, EngineSuiteRuntimeService } from './plugin.js';
+export { EngineSuiteAgentService } from './agent/service.js';
+export type { CreateExternalAgentOptions, DelegateExternalAgentOptions, EngineSuiteAgentHandle } from './agent/service.js';
 export { EngineSuiteGateway } from './remote.js';
-export type { EngineSuiteCatalogView, EngineSuiteCreateAgentRequest, EngineSuiteCreateAgentResponse } from './remote.js';
+export type { EngineSuiteCatalogView, EngineSuiteCreateAgentRequest, EngineSuiteCreateAgentResponse, EngineSuiteDiscoverModelsResponse, EngineSuiteProfileView, EngineSuiteSkillSetView, EngineSuiteMcpSetView, } from './remote.js';
 //# sourceMappingURL=index.d.ts.map

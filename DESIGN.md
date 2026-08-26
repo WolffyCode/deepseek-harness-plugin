@@ -1,100 +1,82 @@
-# dsh-engine-suite architecture
+# Engine Suite 统一本地 Agent 架构
 
-## Goal
+## 发布范围
 
-`@wolffycode/dsh-engine-suite` is one installable DeepSeek Harness plugin. It owns the
-multi-engine catalog and runtime boundary while keeping engine-specific execution behind a
-Driver interface.
+`@wolffycode/dsh-engine-suite` 是一个安装包，提供统一 Harness Session/Workspace 入口和两个外部引擎：
 
-The first driver is `codex-cli`. Claude CLI and the native Harness/DeepSeek driver are future
-implementations of the same contract.
+- `claude-cli`：只服务 GLM 模型，使用 Claude SDK `stream-json`；
+- `codex-cli`：使用 Codex app-server 和 stdio JSON-RPC。
 
-## Product model
+DeepSeek Native Agent 仍由宿主 Harness 提供，不是本插件的外部引擎。Claude Opus 在 catalog、selection、session construction、model switch 和真实 E2E 入口全部禁止。
 
-The user-facing catalog has three layers:
+## 分层
 
 ```text
-Engine → Provider → Model → Reasoning effort
+Harness Conversation / Workspace / Session / Approval
+                         │
+               Engine Suite Remote + UI
+                         │
+             Engine / Provider / Model / Reasoning
+                         │
+                   EngineProfile snapshot
+                         │
+                 ExternalEngineAgent
+                         │
+                 ExternalEngineRuntime
+                    ┌────┴────┐
+              Claude GLM   Codex
 ```
 
-The runtime has one additional internal layer:
+Harness 负责 Session 持久事件、Workspace、权限、Agent 生命周期和 Native Agent。插件负责 catalog、profile policy、外部进程、native session/thread binding、协议事件投影、用户 Skill/MCP 资产和 child Agent bridge；插件不复制 Harness 历史或 Workspace。
+
+## 通用运行时
+
+`src/agent/runtime.ts` 和 `src/agent/external-engine-agent.ts` 提供引擎无关的事件桥：外部 CLI 事件先归一化，再投影为 Harness Session 事件。Claude 具体实现位于 `src/claude/`；Codex 具体实现位于 `src/codex/`。不存在旧的 Claude `launch.ts` 或 `runtime.ts` 模块。
+
+统一事件包括文本增量、tool call、tool result、turn completion、reasoning、usage 和失败/取消。外部 CLI 负责原生规划和工具执行，插件不把 Harness tool schema 或 System Prompt 自动发送给 CLI。
+
+## Claude/GLM
+
+Claude 通过 SDK query 使用 `claude -p` 的 stream-json 能力。启动参数由 `src/claude/session.ts` 和 `src/claude/transport.ts` 组织，包含 bare、stream input/output、partial message、model 和 effort；权限由 `src/claude/control.ts` 转到 Harness Approval。
+
+Provider 只以 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 和内存 credential 组成当前进程环境。Harness prompt、tool schema、Harness/cross-engine agent map 不进入 Claude SDK options。用户显式 Claude agent 定义必须通过 opt-in wrapper。
+
+当前 Claude model policy 是 GLM-only + Opus deny。SDK catalog 中任何 Opus 字段都会被过滤；selection、会话构造、模型切换和真实 E2E 也会再次拒绝。
+
+## Codex
+
+Codex 运行在隔离 `CODEX_HOME`：
 
 ```text
-EngineProfile = validated Engine + Provider + Model + runtime policy snapshot
+Harness Session
+  → Codex Thread ID
+  → isolated CODEX_HOME/config.toml
+  → codex app-server --listen stdio://
 ```
 
-A Session captures the resolved profile and revision at creation time. Editing settings later does
-not change an existing Session.
+`OPENAI_API_KEY` 只通过进程环境传递，配置文件不保存 key。Runtime 归一化 agent message delta、command execution、file change、MCP item、tool result 和 turn completion。
 
-## Package boundary
+## Profile、Session 与 child Agent
 
-The repository is one installable package. Internal modules have one owner and are loaded/unloaded
-by the root plugin; they are not separate user-installed plugins.
+Composer 顺序固定为 `Engine → Provider → Model → Reasoning`。Profile 保存 selection、revision、Skill/MCP 引用和 child policy。空白 Session 才能切换引擎；已有对话保持 engine identity，模型/reasoning 变化复用同一 native session/thread。
 
-```text
-src/
-├── engine/       Engine definitions and capabilities
-├── provider/     Provider records and endpoint validation
-├── model/        Model catalog and reasoning metadata
-├── profile/      Selection validation and immutable snapshots
-├── credential/   Credential references; never raw secrets in domain records
-├── runtime/      Future process and Session binding boundary
-├── codex/        Future Codex app-server driver
-├── agent/        Future Agent factory and parent/child routing
-├── settings/     Future Host/Client settings contribution
-└── conversation/ Future cascading selector contribution
+父子 Agent 使用独立 Harness Session，并通过 `parentSession`、`origin=subagent`、`delegationDepth` 建立 lineage。`allowedChildProfiles`、`maxChildDepth` 和 `maxConcurrentChildren` 必须授权；本地 MCP bridge 不传 credential。
+
+## Skill / MCP 与安全
+
+Skill/MCP 是 Profile 显式引用的用户运行资产，不是 Harness 内部资产的隐式注入。MCP static environment 禁止 secret-like key；credentialRef 由宿主 credential 服务解析。CLI tool call 只做事件投影，不冒充 Harness tool loop。
+
+## 可复现发布门禁
+
+```bash
+pnpm install
+npm run typecheck
+npm test
+npm run build
+pnpm test
+git diff --check
 ```
 
-## Codex v1 boundary
+截至 2026-08-26 的真实基线是：`npm run typecheck` 通过；`npm test` 和 `pnpm test` 均为 **135 tests / 134 pass / 1 external skip**；`npm run build` 通过，并生成可发布的 Host、Remote、client bundle 与 client declaration artifacts。外部 skip 是真实 Claude E2E：它需要 Claude-compatible endpoint、认证环境变量、可执行的本地 `claude` CLI 和 GLM model；缺少任一前置时 skip 是显式结果，不得改成无条件通过。
 
-The Codex driver will use a local `codex app-server` process. Harness Session is the durable
-source of truth; Codex Thread and process identifiers are external bindings.
-
-Codex-owned tool activity is not converted into Harness `tool/call` / `tool/result`, because those
-events mean that the Harness Agent requested a Harness tool. Engine activity will use a separate
-normalized event family for UI, telemetry, and replay-safe display.
-
-## Provider policy
-
-The first provider contract supports API-key authentication and the Responses wire protocol. The
-provider stores a credential reference, not the key. Local debugging reads credentials only from
-environment variables:
-
-- `DSH_DEBUG_CODEX_BASE_URI`
-- `DSH_DEBUG_CODEX_API_KEY`
-
-A real key must never be committed, logged, or placed in a Session.
-
-## Model policy
-
-Model discovery is capability-driven. A provider may return model IDs and model-specific reasoning
-options; discovery failure must eventually support manual model registration. Context window data
-is metadata, not proof of service-side support. The UI may expose a 1M toggle, while the domain
-stores a numeric `contextWindowTokens` and its source.
-
-## Agent bridge
-
-The plugin-owned `EngineSuiteAgentService` creates an external Codex Agent, enters its Session and Agent into the Harness registries, and owns teardown. This path intentionally uses the public `SessionStore` and `AgentRegistry` lifecycle primitives rather than replacing Harness source files.
-
-The first Agent bridge is intentionally narrow: Codex owns its tool loop, while the bridge projects user messages, text deltas, assistant messages, turn boundaries, status, cancellation, and process teardown. Codex tool activity remains engine activity and is never replayed as a Harness tool call.
-
-## Parent/child policy
-
-Every Agent owns one EngineProfile snapshot. A child may use a different profile, but the parent
-passes a profile ID, never a base URI, credential, or API key. A future parent/child router will
-validate `allowedChildProfiles`, depth, concurrency, and caller identity before creating the child.
-
-The first child milestone is foreground Codex → Codex. A future Codex-to-other-engine path will use
-a Harness-controlled MCP bridge bound to the caller Agent; it will not accept a caller-supplied
-parent identity.
-
-## Implementation sequence
-
-1. Domain catalog and profile validation (current foundation).
-2. Codex app-server transport and process ownership.
-3. Codex Agent Driver and Harness Session binding.
-4. Settings and model discovery.
-5. Conversation selector and immutable profile snapshot.
-6. Foreground child Agent and profile policy.
-7. Harness MCP bridge and background child lifecycle.
-8. Claude CLI and native Harness drivers.
+pnpm 的独立仓库修复、依赖版本选择和 Typert generator 发布依赖见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。

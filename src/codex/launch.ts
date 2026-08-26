@@ -2,8 +2,10 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ModelRecord } from '../model/types.js'
+import type { EngineMcpSet, EngineSkillSet } from '../assets.js'
 import type { EngineProvider } from '../provider/types.js'
 import type { EngineProfileSnapshot } from '../profile/types.js'
+import type { JsonRpcRequestHandler } from './json-rpc.js'
 import { CodexRuntime, type CodexRuntimeOptions } from './runtime.js'
 import { renderCodexConfig } from './config.js'
 
@@ -19,6 +21,13 @@ export interface CodexLaunchOptions {
   readonly baseInstructions?: string
   readonly ephemeral?: boolean
   readonly runtimeRoot?: string
+  readonly preserveRuntimeRoot?: boolean
+  readonly resumeThreadId?: string
+  readonly permissionPreset?: string
+  readonly serverRequestHandler?: JsonRpcRequestHandler
+  readonly mcpSet?: EngineMcpSet
+  readonly skillSet?: EngineSkillSet
+  readonly environment?: Readonly<Record<string, string>>
 }
 
 export interface CodexLaunch {
@@ -56,6 +65,7 @@ export async function openCodexLaunch(options: CodexLaunchOptions): Promise<Code
     baseUri: options.provider.baseUri,
     model: options.model.modelId,
     apiKey,
+    ...options.mcpSet === undefined ? {} : { mcpSet: options.mcpSet },
   })
   await writeFile(join(codexHome, 'config.toml'), materialized.configToml, { encoding: 'utf8', mode: 0o600 })
   const runtimeOptions: CodexRuntimeOptions = {
@@ -68,16 +78,22 @@ export async function openCodexLaunch(options: CodexLaunchOptions): Promise<Code
     ...options.profile.reasoningEffort === undefined ? {} : { reasoningEffort: options.profile.reasoningEffort },
     ...options.baseInstructions === undefined ? {} : { baseInstructions: options.baseInstructions },
     ephemeral: options.ephemeral ?? false,
+    ...options.permissionPreset === 'read-only' ? { approvalPolicy: 'on-request' as const, sandbox: 'read-only' as const } : {},
+    ...options.permissionPreset === 'workspace-write' ? { approvalPolicy: 'on-request' as const, sandbox: 'workspace-write' as const } : {},
+    ...options.permissionPreset === 'danger-full-access' ? { approvalPolicy: 'never' as const, sandbox: 'danger-full-access' as const } : {},
     env: {
       CODEX_HOME: codexHome,
       ...materialized.environment,
+      ...options.environment ?? {},
     },
-    redactions: [...materialized.redactions],
+    redactions: [...materialized.redactions, ...Object.values(options.environment ?? {})],
+    ...options.serverRequestHandler === undefined ? {} : { serverRequestHandler: options.serverRequestHandler },
   }
   let runtime: CodexRuntime
   try {
     runtime = await CodexRuntime.open(runtimeOptions)
-    await runtime.startThread()
+    if (options.resumeThreadId === undefined) await runtime.startThread()
+    else await runtime.resumeThread(options.resumeThreadId)
   } catch (error: unknown) {
     await rm(runtimeRoot, { recursive: true, force: true })
     throw error
@@ -92,7 +108,7 @@ export async function openCodexLaunch(options: CodexLaunchOptions): Promise<Code
       if (closed) return
       closed = true
       await runtime.close()
-      await rm(runtimeRoot, { recursive: true, force: true })
+      if (options.preserveRuntimeRoot !== true) await rm(runtimeRoot, { recursive: true, force: true })
     },
   }
 }

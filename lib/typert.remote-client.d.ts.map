@@ -1,0 +1,1 @@
+{"version":3,"file":"typert.remote-client.d.ts","names":["cancelAgent","catalog","createAgent","discoverModels","sessionCommands","switchAgent"],"sources":["../src/remote.ts"],"sourcesContent":[null],"mappings":";;;;;;;;;IAqRQA,W;IAtOAC,O;IAyIAC,W;IA6DAC,c;IAXAC,e;IArBAC,W;;;IAgEAL,gC;IAtOAC,4B;IAyIAC,gC;IA6DAC,mC;IAXAC,oC;IArBAC,gC","ignoreList":[]}

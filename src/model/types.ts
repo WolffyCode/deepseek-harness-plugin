@@ -41,6 +41,8 @@ export interface CreateModelInput {
   readonly contextWindowTokens?: number
   readonly contextWindowSource?: ContextWindowSource
   readonly source: ModelSource
+  readonly enabled?: boolean
+  readonly hidden?: boolean
 }
 
 export function createModel(input: CreateModelInput): ModelRecord {
@@ -68,8 +70,8 @@ export function createModel(input: CreateModelInput): ModelRecord {
     modelId,
     ...input.displayName === undefined ? {} : { displayName: input.displayName.trim() },
     ...input.description === undefined ? {} : { description: input.description },
-    enabled: true,
-    hidden: false,
+    enabled: input.enabled ?? true,
+    hidden: input.hidden ?? false,
     reasoningOptions,
     ...input.defaultReasoningEffort === undefined ? {} : { defaultReasoningEffort: input.defaultReasoningEffort },
     inputModalities: [...input.inputModalities ?? ['text']],

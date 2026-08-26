@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { childEnvironment } from '../process-env.js'
 import { once } from 'node:events'
 import type { JsonRpcLineTransport } from './json-rpc.js'
 
@@ -40,16 +43,68 @@ function killProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.S
   }
 }
 
+
+async function scrubSecretFiles(root: string | undefined, secrets: readonly string[]): Promise<void> {
+  if (root === undefined || secrets.length === 0) return
+  const snapshotRoot = join(root, 'shell_snapshots')
+  const walk = async (directory: string): Promise<void> => {
+    let entries
+    try { entries = await readdir(directory, { withFileTypes: true }) } catch { return }
+    await Promise.all(entries.map(async entry => {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        await walk(path)
+        return
+      }
+      try {
+        const original = await readFile(path, 'utf8')
+        let scrubbed = original
+        for (const secret of secrets) {
+          if (secret.length > 0) scrubbed = scrubbed.split(secret).join('[REDACTED]')
+        }
+        if (scrubbed !== original) await writeFile(path, scrubbed, 'utf8')
+      } catch {
+        // Snapshot files can disappear while Codex rotates them.
+      }
+    }))
+  }
+  await walk(snapshotRoot)
+}
+
+function createSecretScrubber(root: string | undefined, secrets: readonly string[]): {
+  readonly stop: () => Promise<void>
+} {
+  if (root === undefined || secrets.length === 0) return { stop: async () => {} }
+  let running = false
+  const scrub = async (): Promise<void> => {
+    if (running) return
+    running = true
+    try { await scrubSecretFiles(root, secrets) } finally { running = false }
+  }
+  const timer = setInterval(() => { void scrub() }, 100)
+  timer.unref?.()
+  void scrub()
+  return {
+    stop: async () => {
+      clearInterval(timer)
+      await scrub()
+    },
+  }
+}
+
 /** Owns one Codex app-server process and its complete teardown. */
 export class CodexProcess {
   readonly child: ChildProcessWithoutNullStreams
   private stderr = ''
   private disposed = false
   private readonly exitPromise: Promise<ProcessExit>
+  private readonly closePromise: Promise<void>
+  private readonly terminationPromise: Promise<ProcessExit>
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
     private readonly options: Required<Pick<CodexProcessOptions, 'disposeGraceMs' | 'redactions'>>,
+    private readonly scrubber: { readonly stop: () => Promise<void> },
   ) {
     this.child = child
     child.stderr.on('data', chunk => {
@@ -65,16 +120,14 @@ export class CodexProcess {
         ...error === undefined ? {} : { error },
       }))
     })
+    this.closePromise = once(child, 'close').then(() => undefined)
+    this.terminationPromise = Promise.all([this.exitPromise, this.closePromise]).then(([exit]) => exit)
   }
 
   static start(options: CodexProcessOptions): CodexProcess {
     const executable = options.executable ?? 'codex'
     const args = [...options.args ?? ['app-server', '--listen', 'stdio://']]
-    const env: NodeJS.ProcessEnv = { ...process.env }
-    for (const [key, value] of Object.entries(options.env ?? {})) {
-      if (value === undefined) delete env[key]
-      else env[key] = value
-    }
+    const env = childEnvironment(options.env)
     const child = spawn(executable, args, {
       cwd: options.cwd,
       env,
@@ -82,10 +135,11 @@ export class CodexProcess {
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+    const redactions = options.redactions ?? []
     return new CodexProcess(child, {
       disposeGraceMs: options.disposeGraceMs ?? 3_000,
-      redactions: options.redactions ?? [],
-    })
+      redactions,
+    }, createSecretScrubber(options.env?.['CODEX_HOME'], redactions))
   }
 
   get stderrTail(): string {
@@ -97,22 +151,33 @@ export class CodexProcess {
   }
 
   async dispose(): Promise<ProcessExit> {
-    if (this.disposed) return this.exitPromise
+    if (this.disposed) return this.terminationPromise
     this.disposed = true
     this.child.stdin.end()
-    const first = await Promise.race([
-      this.exitPromise.then(value => ({ done: true as const, value })),
-      new Promise<{ done: false }>(resolve => setTimeout(() => resolve({ done: false }), this.options.disposeGraceMs)),
-    ])
-    if (first.done) return first.value
+    const first = await this.waitForTermination(this.options.disposeGraceMs)
+    if (first !== undefined) { await this.scrubber.stop(); return first }
     killProcessTree(this.child, 'SIGTERM')
-    const second = await Promise.race([
-      this.exitPromise.then(value => ({ done: true as const, value })),
-      new Promise<{ done: false }>(resolve => setTimeout(() => resolve({ done: false }), this.options.disposeGraceMs)),
-    ])
-    if (second.done) return second.value
+    const second = await this.waitForTermination(this.options.disposeGraceMs)
+    if (second !== undefined) { await this.scrubber.stop(); return second }
     killProcessTree(this.child, 'SIGKILL')
-    return this.exitPromise
+    this.child.stdin.destroy()
+    this.child.stdout.destroy()
+    this.child.stderr.destroy()
+    const result = await this.terminationPromise
+    await this.scrubber.stop()
+    return result
+  }
+
+  private async waitForTermination(graceMs: number): Promise<ProcessExit | undefined> {
+    let timer: NodeJS.Timeout | undefined
+    try {
+      return await Promise.race([
+        this.terminationPromise,
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), graceMs) }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 }
 

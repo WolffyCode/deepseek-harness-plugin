@@ -18,6 +18,8 @@ export function resolveEngineProfile(
     readonly allowedChildProfiles?: readonly EngineProfileId[]
     readonly maxChildDepth?: number
     readonly maxConcurrentChildren?: number
+    readonly skillSetRef?: string
+    readonly mcpSetRef?: string
   } = {},
 ): EngineProfileSnapshot {
   const engine = dependencies.engines.get(selection.engineId)
@@ -54,6 +56,8 @@ export function resolveEngineProfile(
     modelId: model.modelId,
     ...selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort },
     ...model.contextWindowTokens === undefined ? {} : { contextWindowTokens: model.contextWindowTokens },
+    ...options.skillSetRef === undefined ? {} : { skillSetRef: options.skillSetRef },
+    ...options.mcpSetRef === undefined ? {} : { mcpSetRef: options.mcpSetRef },
     allowedChildProfiles: [...options.allowedChildProfiles ?? []],
     maxChildDepth,
     maxConcurrentChildren,

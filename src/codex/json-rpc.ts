@@ -182,8 +182,17 @@ export class JsonRpcLineTransport {
       this.close(new Error(`invalid JSON-RPC line: ${errorFromUnknown(error).message}`))
       return
     }
-    if (!isObject(value) || value['jsonrpc'] !== '2.0') {
+    if (!isObject(value)) {
       this.close(new Error('invalid JSON-RPC message'))
+      return
+    }
+    // Codex app-server speaks JSON-RPC over stdio but omits the JSON-RPC 2.0
+    // marker on responses and notifications. Requests we send retain the
+    // marker; the reader accepts both the strict fixture shape and Codex's
+    // canonical `{id,result}` / `{method,params}` shape.
+    const protocol = value['jsonrpc']
+    if (protocol !== undefined && protocol !== '2.0') {
+      this.close(new Error('invalid JSON-RPC version'))
       return
     }
     if ('method' in value && typeof value['method'] === 'string') {
