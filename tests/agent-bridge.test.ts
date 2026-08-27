@@ -183,7 +183,7 @@ test('ExternalEngineAgent keeps deltas emitted before the CLI turn acknowledgeme
     "rl.on('line',line=>{const m=JSON.parse(line);",
     "if(m.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n');",
     "else if(m.method==='thread/start') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{thread:{id:'early-thread',ephemeral:false}}})+'\\n');",
-    "else if(m.method==='turn/start'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'early-turn',delta:'early-'}})+'\\n'); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{turn:{id:'early-turn'}}})+'\\n'); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'early-turn',delta:'delta'}})+'\\n'),5); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'early-turn',status:'completed'}}})+'\\n'),15);}",
+    "else if(m.method==='turn/start'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'early-turn',delta:'early-'}})+'\\n'); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'early-turn',delta:'delta'}})+'\\n'),5); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'early-turn',status:'completed'}}})+'\\n'),200); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{turn:{id:'early-turn'}}})+'\\n'),400);}",
     "});",
   ].join('')
   const handle = await suite.agents.createCodex({
@@ -193,11 +193,134 @@ test('ExternalEngineAgent keeps deltas emitted before the CLI turn acknowledgeme
   })
   try {
     handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'stream now' }], source: { kind: 'user' } }))
+    const deadline = Date.now() + 1_000
+    while (!handle.session.events.some((event: SessionEvent) => event.type === 'assistant/chunk')) {
+      if (Date.now() >= deadline) throw new Error('timed out waiting for the first streamed chunk')
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    assert.equal(handle.session.events.some((event: SessionEvent) => event.type === 'turn/end'), false)
     await handle.agent.whenIdle()
     const assistant = handle.session.events.find((event: SessionEvent) => event.type === 'assistant/message')
     assert.equal(assistant?.type, 'assistant/message')
     if (assistant?.type === 'assistant/message') assert.deepEqual(assistant.data.message.content, [{ type: 'text', text: 'early-delta' }])
     assert.equal(handle.session.events.filter((event: SessionEvent) => event.type === 'assistant/chunk').length, 2)
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('ExternalEngineAgent projects reasoning, tools, usage, and text in arrival order', async () => {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  apply(ctx)
+  const suite = ctx.get('engineSuite') as EngineSuiteRuntimeService
+  suite.providers.register({
+    id: 'ordered-provider', engineId: 'codex-cli', name: 'Ordered Provider',
+    baseUri: 'https://example.test', credentialRef: 'ordered-credential',
+  })
+  suite.models.register({
+    id: 'ordered-model', engineId: 'codex-cli', providerId: 'ordered-provider', modelId: 'ordered-model',
+    reasoningOptions: [{ id: 'low' }], source: 'manual',
+  })
+  const script = [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');",
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize') send({jsonrpc:'2.0',id:m.id,result:{ok:true}});",
+    "else if(m.method==='thread/start') send({jsonrpc:'2.0',id:m.id,result:{thread:{id:'ordered-thread',ephemeral:false}}});",
+    "else if(m.method==='turn/start'){send({jsonrpc:'2.0',method:'item/reasoning/textDelta',params:{turnId:'ordered-turn',delta:'thinking'}}); setTimeout(()=>send({jsonrpc:'2.0',method:'item/started',params:{turnId:'ordered-turn',item:{id:'ordered-tool',type:'commandExecution',command:'echo ordered',status:'inProgress'}}}),5); setTimeout(()=>send({jsonrpc:'2.0',method:'thread/tokenUsage/updated',params:{turnId:'ordered-turn',tokenUsage:{total:{inputTokens:11,cachedInputTokens:3,outputTokens:4},modelContextWindow:64000}}}),10); setTimeout(()=>send({jsonrpc:'2.0',method:'item/completed',params:{turnId:'ordered-turn',item:{id:'ordered-tool',type:'commandExecution',command:'echo ordered',aggregatedOutput:'tool output',status:'completed'}}}),15); setTimeout(()=>send({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'ordered-turn',delta:'answer '}}),20); setTimeout(()=>send({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'ordered-turn',delta:'now'}}),25); setTimeout(()=>send({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'ordered-turn',status:'completed'}}}),150); setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{turn:{id:'ordered-turn'}}}),500);}",
+    "});",
+  ].join('')
+  const handle = await suite.agents.createCodex({
+    sessionId: 'ordered-agent',
+    selection: { engineId: 'codex-cli', providerId: 'ordered-provider', modelRecordId: 'ordered-model', reasoningEffort: 'low' },
+    apiKey: 'ordered-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', script],
+  })
+  try {
+    handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'stream all events' }], source: { kind: 'user' } }))
+    const waitFor = async (predicate: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 1_000
+      while (!predicate()) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for ordered stream event')
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+    }
+    await waitFor(() => handle.session.events.some((event: SessionEvent) => event.type === 'assistant/chunk'))
+    assert.equal(handle.session.events.some((event: SessionEvent) => event.type === 'turn/end'), false)
+    await waitFor(() => handle.session.events.some((event: SessionEvent) => event.type === 'tool/result'))
+    assert.equal(handle.session.events.some((event: SessionEvent) => event.type === 'turn/end'), false)
+    await waitFor(() => handle.session.events.filter((event: SessionEvent) => event.type === 'assistant/chunk').length === 4)
+    assert.equal(handle.session.events.some((event: SessionEvent) => event.type === 'turn/end'), false)
+
+    const chunks = handle.session.events
+      .filter((event: SessionEvent) => event.type === 'assistant/chunk')
+      .map(event => event.type === 'assistant/chunk' ? event.data.chunk : undefined)
+    assert.deepEqual(chunks.map(chunk => chunk?.type), ['reasoning-delta', 'usage', 'text-delta', 'text-delta'])
+    assert.deepEqual(chunks[0], { type: 'reasoning-delta', index: 1, text: 'thinking' })
+    assert.deepEqual(chunks[1], {
+      type: 'usage',
+      usage: {
+        inputTokens: 11,
+        outputTokens: 4,
+        cacheReadTokens: 3,
+        contextWindowMaxTokens: 64000,
+        breakdown: { total: { inputTokens: 11, cachedInputTokens: 3, outputTokens: 4 } },
+      },
+    })
+    const toolCall = handle.session.events.find((event: SessionEvent) => event.type === 'tool/call')
+    assert.equal(toolCall?.type, 'tool/call')
+    const toolResult = handle.session.events.find((event: SessionEvent) => event.type === 'tool/result')
+    assert.equal(toolResult?.type, 'tool/result')
+    await handle.agent.whenIdle()
+    const assistant = handle.session.events.filter((event: SessionEvent) => event.type === 'assistant/message').at(-1)
+    assert.equal(assistant?.type, 'assistant/message')
+    if (assistant?.type === 'assistant/message') {
+      assert.deepEqual(assistant.data.message.content, [
+        { type: 'reasoning', text: 'thinking' },
+        { type: 'text', text: 'answer now' },
+      ])
+      assert.deepEqual(assistant.data.usage, {
+        inputTokens: 11,
+        outputTokens: 4,
+        cacheReadTokens: 3,
+        contextWindowMaxTokens: 64000,
+        breakdown: { total: { inputTokens: 11, cachedInputTokens: 3, outputTokens: 4 } },
+      })
+    }
+  } finally {
+    await handle.dispose()
+  }
+})
+
+test('ExternalEngineAgent suppresses late duplicate tool lifecycle events', async () => {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  apply(ctx)
+  const suite = ctx.get('engineSuite') as EngineSuiteRuntimeService
+  suite.providers.register({ id: 'duplicate-tool-provider', engineId: 'codex-cli', name: 'Duplicate Tool Provider', baseUri: 'https://example.test', credentialRef: 'duplicate-tool-credential' })
+  suite.models.register({ id: 'duplicate-tool-model', engineId: 'codex-cli', providerId: 'duplicate-tool-provider', modelId: 'duplicate-tool-model', reasoningOptions: [{ id: 'low' }], source: 'manual' })
+  const script = [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');",
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize') send({jsonrpc:'2.0',id:m.id,result:{ok:true}});",
+    "else if(m.method==='thread/start') send({jsonrpc:'2.0',id:m.id,result:{thread:{id:'duplicate-tool-thread',ephemeral:false}}});",
+    "else if(m.method==='turn/start'){send({jsonrpc:'2.0',id:m.id,result:{turn:{id:'duplicate-tool-turn'}}}); setTimeout(()=>send({jsonrpc:'2.0',method:'item/started',params:{turnId:'duplicate-tool-turn',item:{id:'duplicate-tool',type:'commandExecution',command:'echo duplicate',status:'inProgress'}}}),5); setTimeout(()=>send({jsonrpc:'2.0',method:'item/completed',params:{turnId:'duplicate-tool-turn',item:{id:'duplicate-tool',type:'commandExecution',command:'echo duplicate',aggregatedOutput:'first result',status:'completed'}}}),10); setTimeout(()=>send({jsonrpc:'2.0',method:'item/started',params:{turnId:'duplicate-tool-turn',item:{id:'duplicate-tool',type:'commandExecution',command:'echo duplicate',status:'inProgress'}}}),15); setTimeout(()=>send({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'duplicate-tool-turn',status:'completed'}}}),30);}",
+    "});",
+  ].join('')
+  const handle = await suite.agents.createCodex({
+    sessionId: 'duplicate-tool-agent',
+    selection: { engineId: 'codex-cli', providerId: 'duplicate-tool-provider', modelRecordId: 'duplicate-tool-model', reasoningEffort: 'low' },
+    apiKey: 'duplicate-tool-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', script],
+  })
+  try {
+    handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'deduplicate tool events' }], source: { kind: 'user' } }))
+    await handle.agent.whenIdle()
+    assert.equal(handle.session.events.filter((event: SessionEvent) => event.type === 'tool/call').length, 1)
+    assert.equal(handle.session.events.filter((event: SessionEvent) => event.type === 'tool/result').length, 1)
+    assert.equal(handle.session.events.some((event: SessionEvent) => event.type === 'turn/end' && event.data.reason.kind === 'completed'), true)
   } finally {
     await handle.dispose()
   }

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, unlink, writeFile, type FileHandle } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, dirname, join, resolve } from 'node:path'
 import type { EngineSelection } from '../profile/types.js'
@@ -30,18 +30,62 @@ const legacyBindingKeys = [...currentBindingKeys, 'threadId'] as const
 const selectionKeys = ['engineId', 'providerId', 'modelRecordId', 'reasoningEffort'] as const
 const credentialArgumentPattern = /(?:^|[-_=:])(api[-_]?key|access[-_]?token|auth(?:entication)?[-_]?token|credential|password|secret|authorization)(?:$|[-_=:])/iu
 
-/** Serializes binding read-modify-write transactions across store instances in this process. */
+function nextLockTurn(): Promise<void> {
+  return new Promise(resolveCurrent => setImmediate(resolveCurrent))
+}
+
+/** Acquire an OS-visible lock after the process-local queue has serialized callers in this process. */
+async function acquireFileLock(file: string): Promise<() => Promise<void>> {
+  const lockFile = `${file}.lock`
+  await mkdir(dirname(file), { recursive: true })
+  while (true) {
+    let handle: FileHandle | undefined
+    try {
+      handle = await open(lockFile, 'wx', 0o600)
+      await handle.writeFile(`${process.pid}\n`, 'utf8')
+      return async () => {
+        await handle!.close()
+        await unlink(lockFile).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        })
+      }
+    } catch (error: unknown) {
+      await handle?.close().catch(() => undefined)
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      try {
+        const owner = Number((await readFile(lockFile, 'utf8')).trim())
+        if (Number.isSafeInteger(owner) && owner > 0) process.kill(owner, 0)
+      } catch (ownerError: unknown) {
+        if ((ownerError as NodeJS.ErrnoException).code === 'ESRCH') {
+          await unlink(lockFile).catch((unlinkError: unknown) => {
+            if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError
+          })
+          continue
+        }
+      }
+      await nextLockTurn()
+    }
+  }
+}
+
+/** Serializes binding read-modify-write transactions across store instances and processes. */
 async function withFileLock<T>(file: string, operation: () => Promise<T>): Promise<T> {
   const previous = fileLocks.get(file)
-  let release!: () => void
-  const current = new Promise<void>(resolveCurrent => { release = resolveCurrent })
+  let releaseProcess!: () => void
+  const current = new Promise<void>(resolveCurrent => { releaseProcess = resolveCurrent })
   fileLocks.set(file, current)
   await previous?.catch(() => undefined)
+  let releaseFile: (() => Promise<void>) | undefined
   try {
+    releaseFile = await acquireFileLock(file)
     return await operation()
   } finally {
-    release()
-    if (fileLocks.get(file) === current) fileLocks.delete(file)
+    try {
+      await releaseFile?.()
+    } finally {
+      releaseProcess()
+      if (fileLocks.get(file) === current) fileLocks.delete(file)
+    }
   }
 }
 
@@ -158,8 +202,10 @@ export class ExternalEngineBindingStore {
   }
 
   async get(sessionId: string): Promise<ExternalEngineBinding | undefined> {
-    const document = await this.read()
-    return document.bindings.find(binding => binding.sessionId === sessionId)
+    return withFileLock(this.file, async () => {
+      const document = await this.read()
+      return document.bindings.find(binding => binding.sessionId === sessionId)
+    })
   }
 
   async put(binding: ExternalEngineBinding): Promise<void> {
@@ -168,6 +214,15 @@ export class ExternalEngineBindingStore {
       const document = await this.read()
       const bindings = document.bindings.filter(candidate => candidate.sessionId !== normalized.sessionId)
       bindings.push(normalized)
+      await this.write({ version: EXTERNAL_ENGINE_BINDING_SCHEMA_VERSION, bindings })
+    })
+  }
+
+  async remove(sessionId: string): Promise<void> {
+    await withFileLock(this.file, async () => {
+      const document = await this.read()
+      const bindings = document.bindings.filter(binding => binding.sessionId !== sessionId)
+      if (bindings.length === document.bindings.length) return
       await this.write({ version: EXTERNAL_ENGINE_BINDING_SCHEMA_VERSION, bindings })
     })
   }

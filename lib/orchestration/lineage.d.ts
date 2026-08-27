@@ -1,4 +1,4 @@
-export type ParentChildLineageStatus = 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached';
+export type ParentChildLineageStatus = 'starting' | 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached';
 export type ParentChildLineageEventType = 'create' | 'start' | 'progress' | 'result' | 'failure' | 'cancel' | 'archive' | 'detach' | 'resume';
 export type ParentChildLineageTerminalStatus = 'completed' | 'failed' | 'canceled' | 'archived';
 export interface ParentChildLineageDescriptor {

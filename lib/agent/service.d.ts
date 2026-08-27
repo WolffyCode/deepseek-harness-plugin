@@ -59,6 +59,8 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     private readonly lineageStore;
     private readonly closedSessions;
     private readonly childReservations;
+    private readonly pendingChildStarts;
+    private readonly closingParents;
     private readonly sessionOperations;
     constructor(ctx: Context, suite: EngineSuiteRuntime, resolveApiKey: (credentialRef: string) => string | Promise<string>, bindings?: ExternalEngineBindingStore, lineageStore?: ParentChildLineageStore, hostAgentHandles?: HostAgentHandleStore | undefined);
     createExternal(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;
@@ -84,6 +86,7 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     detachChild(childSessionId: string): Promise<ParentChildLineageDescriptor>;
     cancelChild(childSessionId: string): Promise<ParentChildLineageDescriptor>;
     private cancelChildren;
+    private waitForChildStarts;
     private shouldDisposeWithParent;
     private delegateNative;
     private delegateFromBridge;

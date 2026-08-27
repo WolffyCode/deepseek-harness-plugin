@@ -1,6 +1,5 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, ISessions, SessionId, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
@@ -14,6 +13,8 @@ import { createEngineSuiteCatalogController, type EngineSuiteCatalogController, 
 import { EngineSuiteSection } from './EngineSuiteSection.js'
 import { createEngineSuiteAgentPresetFace } from './agent-preset.js'
 import { mountCliSlashSource } from './cli-slash.js'
+import { EngineSuiteRealtimeActivity } from './EngineSuiteRealtimeActivity.js'
+import { createEngineSuiteActivityStore } from './realtime-ui.js'
 
 /** The root half only needs the Remote service so it can mount this package's contribution. */
 export const inject = ['remote']
@@ -55,6 +56,8 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
       const gateway = surfaceCtx.remote.engineSuiteGateway as unknown as EngineSuiteRemoteGateway
       const agentPreset = createEngineSuiteAgentPresetFace(surfaceCtx.get('connection') as ConnectionHandle)
       const catalog: EngineSuiteCatalogController = createEngineSuiteCatalogController(gateway)
+      const activityStore = createEngineSuiteActivityStore()
+      const sessions = surfaceCtx.get('sessions') as ISessions
       void catalog.refresh().catch(() => undefined)
       setEngineSuiteComposerRuntime({
         catalog,
@@ -88,6 +91,24 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
         priority: -10,
         inject: () => ({ agentPreset }),
       }, EngineSuiteComposerSelector))
+
+      // The dock is the client-owned live activity seam. It receives the
+      // Host's incrementally published session snapshot, so the first
+      // working frame does not wait for a provider token or turn completion.
+      surfaceCtx.slots.inject('conversation.input.dock', () => surfaceCtx.slots.register({
+        name: 'conversation.input.dock',
+        id: 'engine-suite-realtime',
+        order: -100,
+        inject: (sessionId: SessionId) => ({
+          activityStore,
+          stop: async () => {
+            const conversation = sessions.scope(sessionId)?.get('conversation')
+            if (conversation === undefined) throw new Error(`conversation unavailable for session ${String(sessionId)}`)
+            await conversation.cancel()
+          },
+        }),
+      }, EngineSuiteRealtimeActivity))
+      surfaceCtx.effect(() => () => activityStore.clear(), 'engine-suite.realtime-activity-store')
     },
   })
   await child.await()

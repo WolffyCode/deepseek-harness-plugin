@@ -200,6 +200,7 @@ export type AgentTimelineItem = {
 } | {
     readonly type: "reasoning";
     readonly text: string;
+    readonly partial?: boolean;
     readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "tool_call";
@@ -209,6 +210,8 @@ export type AgentTimelineItem = {
     readonly input?: unknown;
     readonly output?: unknown;
     readonly error?: string;
+    /** True while the provider is still extending the raw tool arguments. */
+    readonly partial?: boolean;
     readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "todo";
@@ -272,6 +275,7 @@ export type AgentStreamEvent = {
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly usage?: AgentUsage;
+    readonly result?: string;
     readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "turn_failed";
@@ -299,6 +303,12 @@ export type AgentStreamEvent = {
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly text: string;
+    readonly metadata?: AgentEventMetadata;
+} | {
+    readonly type: "status_changed";
+    readonly provider: AgentProvider;
+    readonly turnId?: string;
+    readonly status: string;
     readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "usage_updated";

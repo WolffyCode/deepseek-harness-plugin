@@ -40,7 +40,7 @@ test('ClaudeSessionRuntimeBridge resolves process lifecycle on explicit close', 
   await runtime.close()
 })
 
-test('ClaudeSessionRuntimeBridge does not convert provider status into a terminal error', async () => {
+test('ClaudeSessionRuntimeBridge preserves provider status without converting it into a terminal error', async () => {
   const listeners = new Set<(event: ClaudeAdapterEvent) => void>()
   const session = {
     subscribe(listener: (event: ClaudeAdapterEvent) => void): () => void {
@@ -54,7 +54,7 @@ test('ClaudeSessionRuntimeBridge does not convert provider status into a termina
   runtime.onEvent(event => events.push(event))
   for (const listener of listeners) listener({ type: 'status_changed', status: 'status' })
   await Promise.resolve()
-  assert.deepEqual(events, [])
+  assert.deepEqual(events, [{ type: 'status_changed', provider: 'claude-cli', status: 'status' }])
   await runtime.close()
 })
 
@@ -78,6 +78,28 @@ test('ClaudeSessionRuntimeBridge does not duplicate final assistant text after s
     { type: 'turn_started', provider: 'claude-cli', turnId: 'turn-1' },
     { type: 'timeline', provider: 'claude-cli', turnId: 'turn-1', item: { type: 'assistant_message', text: 'streamed', partial: true } },
     { type: 'turn_completed', provider: 'claude-cli', turnId: 'turn-1' },
+  ])
+  await runtime.close()
+})
+
+test('ClaudeSessionRuntimeBridge does not duplicate final reasoning after streamed thinking deltas', async () => {
+  const listeners = new Set<(event: ClaudeAdapterEvent) => void>()
+  const session = {
+    subscribe(listener: (event: ClaudeAdapterEvent) => void): () => void {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    async close(): Promise<void> {},
+  } as unknown as ClaudeAgentSession
+  const runtime = new ClaudeSessionRuntimeBridge(session)
+  const events: unknown[] = []
+  runtime.onEvent(event => events.push(event))
+  for (const listener of listeners) listener({ type: 'turn_started', turnId: 'turn-thinking' })
+  for (const listener of listeners) listener({ type: 'timeline', turnId: 'turn-thinking', item: { type: 'reasoning', text: 'thinking', partial: true } })
+  for (const listener of listeners) listener({ type: 'timeline', turnId: 'turn-thinking', item: { type: 'reasoning', text: 'thinking' } })
+  assert.deepEqual(events, [
+    { type: 'turn_started', provider: 'claude-cli', turnId: 'turn-thinking' },
+    { type: 'timeline', provider: 'claude-cli', turnId: 'turn-thinking', item: { type: 'reasoning', text: 'thinking', partial: true } },
   ])
   await runtime.close()
 })

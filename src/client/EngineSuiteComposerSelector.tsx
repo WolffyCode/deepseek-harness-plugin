@@ -117,6 +117,7 @@ export function EngineSuiteComposerSelector({
   const [modelQuery, setModelQuery] = useState('')
   const [selectionBusy, setSelectionBusy] = useState(false)
   const [selectionError, setSelectionError] = useState<string | undefined>()
+  const automaticSelectionAttempt = useRef<string | undefined>()
 
   const engines = snapshot.catalog?.engines ?? []
   const providers = useMemo(
@@ -296,6 +297,21 @@ export function EngineSuiteComposerSelector({
       },
     )
   }
+
+  useEffect(() => {
+    if (sessionSummary?.blank !== true || runtime === undefined || snapshot.catalog === null || engineId === '' || providerId === '' || modelRecordId === '') return
+    if (getEngineSuiteSessionSelection(sessionId) !== undefined || selectionBusy) return
+    const selection: EngineSuiteSelectionRequest = {
+      engineId,
+      providerId,
+      modelRecordId,
+      ...reasoningEffort === '' ? {} : { reasoningEffort },
+    }
+    const attemptKey = [sessionId, selection.engineId, selection.providerId, selection.modelRecordId, selection.reasoningEffort ?? ''].join('\u0000')
+    if (automaticSelectionAttempt.current === attemptKey) return
+    automaticSelectionAttempt.current = attemptKey
+    applySelection(selection)
+  }, [engineId, modelRecordId, providerId, reasoningEffort, runtime, selectionBusy, sessionId, sessionSummary?.blank, snapshot.catalog])
 
   const currentSelection = (overrides: Partial<EngineSuiteSelectionRequest> = {}): EngineSuiteSelectionRequest => ({
     engineId,

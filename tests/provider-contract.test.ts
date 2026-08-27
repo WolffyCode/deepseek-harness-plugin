@@ -225,12 +225,16 @@ test("opaque legacy runtime notifications normalize into AgentStreamEvent", () =
   assert.deepEqual(normalizeExternalEngineEvent({ type: "tool-result", id: "tool", output: "ok", isError: false }, "codex-cli", "t"), {
     type: "timeline", provider: "codex-cli", turnId: "t", item: { type: "tool_call", id: "tool", name: "external_tool", status: "completed", output: "ok" },
   });
+  assert.deepEqual(normalizeExternalEngineEvent({ type: "status_changed", status: "thinking", turnId: "t" }, "codex-cli"), {
+    type: "status_changed", provider: "codex-cli", turnId: "t", status: "thinking",
+  });
 });
 
 test("the public event union follows the provider event categories", () => {
   const events: AgentStreamEvent[] = [
     { type: "thread_started", provider: "fake", sessionId: "s" },
     { type: "turn_started", provider: "fake", turnId: "t" },
+    { type: "status_changed", provider: "fake", turnId: "t", status: "thinking" },
     { type: "timeline", provider: "fake", item: { type: "reasoning", text: "x" } },
     { type: "reasoning", provider: "fake", text: "x" },
     { type: "usage_updated", provider: "fake", usage: {} },
@@ -244,7 +248,7 @@ test("the public event union follows the provider event categories", () => {
     { type: "error", provider: "fake", error: "e" },
     { type: "turn_canceled", provider: "fake", reason: "r" },
   ];
-  assert.equal(events.length, 14);
+  assert.equal(events.length, 15);
 });
 
 test("Codex-only details normalize into provider-neutral metadata without protocol names", () => {

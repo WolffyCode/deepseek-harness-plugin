@@ -13,7 +13,7 @@ import {
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { CallId, createAssistantMessage, createToolResultMessage, type LlmFailure, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session'
-import type { AgentStreamEvent, AgentTimelineItem } from './provider-contract.js'
+import type { AgentStreamEvent, AgentTimelineItem, AgentUsage } from './provider-contract.js'
 import { normalizeExternalEngineEvent, type ExternalEngineRuntime } from './runtime.js'
 
 interface RunningPhase {
@@ -47,7 +47,7 @@ function deferred<T>(): {
 
 interface TurnResult {
   readonly text: string
-  readonly chunkSeqs: number[]
+  readonly usage?: AgentUsage
   readonly canceled?: boolean
   readonly reason?: string
 }
@@ -82,6 +82,30 @@ function serialized(value: unknown): string {
 
 function isTerminal(event: AgentStreamEvent): boolean {
   return event.type === 'turn_completed' || event.type === 'turn_failed' || event.type === 'turn_canceled' || event.type === 'error'
+}
+
+type SessionTokenUsage = {
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens?: number
+  readonly reasoningTokens?: number
+  readonly totalCostUsd?: number
+  readonly contextWindowMaxTokens?: number
+  readonly contextWindowUsedTokens?: number
+  readonly breakdown?: AgentUsage['breakdown']
+}
+
+function sessionUsage(usage: AgentUsage): SessionTokenUsage {
+  return {
+    inputTokens: usage.inputTokens ?? 0,
+    outputTokens: usage.outputTokens ?? 0,
+    ...(usage.cachedInputTokens === undefined ? {} : { cacheReadTokens: usage.cachedInputTokens }),
+    ...(usage.breakdown?.turn?.reasoningTokens === undefined ? {} : { reasoningTokens: usage.breakdown.turn.reasoningTokens }),
+    ...(usage.totalCostUsd === undefined ? {} : { totalCostUsd: usage.totalCostUsd }),
+    ...(usage.contextWindowMaxTokens === undefined ? {} : { contextWindowMaxTokens: usage.contextWindowMaxTokens }),
+    ...(usage.contextWindowUsedTokens === undefined ? {} : { contextWindowUsedTokens: usage.contextWindowUsedTokens }),
+    ...(usage.breakdown === undefined ? {} : { breakdown: usage.breakdown }),
+  }
 }
 
 /**
@@ -232,31 +256,18 @@ export class ExternalEngineAgent implements Agent {
           for (const message of messages) this.session.append('user/message', message, { surfaceOp: 'append' })
           const prompt = messages.map(textFromMessage).filter(Boolean).join('\n\n')
           if (prompt.length === 0) throw new Error('External Engine Agent received an empty text task')
-          // The listener is installed before startTurn. Both CLI transports can
-          // emit a delta synchronously while acknowledging their turn.
+          // The listener is installed before startTurn. A provider may emit its
+          // turn id and deltas before the start request resolves, so startTurn
+          // and stream completion must be observed independently.
           const pendingTurn = this.waitTurn(phase.abort.signal, turn, step)
-          let result: TurnResult
-          try {
-            const started = await this.runtime.startTurn(prompt, phase.abort.signal)
-            pendingTurn.bindRuntimeTurn(started.id)
-            result = await pendingTurn.promise
-          } catch (error: unknown) {
-            pendingTurn.fail(error instanceof Error ? error : new Error(String(error)))
-            await pendingTurn.promise.catch(() => {})
-            throw error
-          }
+          void this.runtime.startTurn(prompt, phase.abort.signal).then(
+            started => pendingTurn.bindRuntimeTurn(started.id),
+            error => pendingTurn.fail(error instanceof Error ? error : new Error(String(error))),
+          )
+          const result = await pendingTurn.promise
           if (result.canceled) {
             turnReason = { kind: 'aborted', reason: (result.reason ?? 'external engine turn canceled') as unknown as AgentCancelCause }
             phase.abort.abort(result.reason ?? 'external engine turn canceled')
-          } else if (result.text.length > 0) {
-            this.session.append('assistant/message', {
-              turn,
-              step,
-              message: createAssistantMessage({
-                content: [{ type: 'text', text: result.text }],
-                source: { provider: this.provider, model: this.model },
-              }),
-            }, { surfaceOp: 'append', sourceEventSeqs: result.chunkSeqs })
           }
         } catch (error: unknown) {
           if (phase.abort.signal.aborted) {
@@ -284,19 +295,103 @@ export class ExternalEngineAgent implements Agent {
     const result = deferred<TurnResult>()
     let text = ''
     const chunkSeqs: number[] = []
-    const toolCalls = new Map<string, { readonly callId: ReturnType<typeof CallId>; readonly name: string }>()
+    const sourceChunkSeqs: number[] = []
+    const assistantParts: Array<{ type: 'text' | 'reasoning'; text: string }> = []
+    const toolCalls = new Map<string, { readonly callId: ReturnType<typeof CallId>; readonly name: string; readonly index: number; argumentsText: string }>()
+    const completedToolCalls = new Set<string>()
+    let nextToolIndex = 2
+    let usage: AgentUsage | undefined
     let expectedRuntimeTurnId: string | undefined
     const bufferedEvents: AgentStreamEvent[] = []
     let settled = false
     let unsubscribe = (): void => {}
 
+    const appendAssistantPart = (type: 'text' | 'reasoning', value: string): void => {
+      if (value.length === 0) return
+      const previous = assistantParts.at(-1)
+      if (previous?.type === type) previous.text += value
+      else assistantParts.push({ type, text: value })
+    }
+
+    const appendText = (value: string, partial: boolean): void => {
+      if (value.length === 0) return
+      const delta = partial
+        ? value
+        : value === text
+          ? ''
+          : value.startsWith(text)
+            ? value.slice(text.length)
+            : text.endsWith(value)
+              ? ''
+              : value
+      if (delta.length === 0) return
+      text += delta
+      appendAssistantPart('text', delta)
+      const seq = this.session.append('assistant/chunk', {
+        turn,
+        step,
+        chunk: { type: 'text-delta', index: 0, text: delta },
+      }).seq
+      chunkSeqs.push(seq)
+      sourceChunkSeqs.push(seq)
+    }
+
+    const appendReasoning = (value: string): void => {
+      if (value.length === 0) return
+      appendAssistantPart('reasoning', value)
+      const seq = this.session.append('assistant/chunk', {
+        turn,
+        step,
+        chunk: { type: 'reasoning-delta', index: 1, text: value },
+      }).seq
+      chunkSeqs.push(seq)
+      sourceChunkSeqs.push(seq)
+    }
+
+    const appendUsage = (nextUsage: AgentUsage): void => {
+      usage = nextUsage
+      chunkSeqs.push(this.session.append('assistant/chunk', {
+        turn,
+        step,
+        chunk: { type: 'usage', usage: sessionUsage(nextUsage) },
+      }).seq)
+    }
+
+    const appendToolArguments = (call: { readonly callId: ReturnType<typeof CallId>; readonly name: string; readonly index: number; argumentsText: string }, nextArguments: string): void => {
+      if (nextArguments === call.argumentsText) return
+      if (!nextArguments.startsWith(call.argumentsText)) {
+        call.argumentsText = nextArguments
+        return
+      }
+      const argumentsDelta = nextArguments.slice(call.argumentsText.length)
+      call.argumentsText = nextArguments
+      if (argumentsDelta.length === 0) return
+      chunkSeqs.push(this.session.append('assistant/chunk', {
+        turn,
+        step,
+        chunk: {
+          type: 'tool-call-delta',
+          index: call.index,
+          id: call.callId,
+          ...(call.name === 'external_tool' ? {} : { name: call.name }),
+          argumentsDelta,
+        },
+      }).seq)
+    }
+
     const appendToolCall = (item: Extract<AgentTimelineItem, { type: 'tool_call' }>): void => {
-      const rawId = item.id.length > 0 ? item.id : `${turn}-${step}-${toolCalls.size + 1}`
-      if (toolCalls.has(rawId)) return
+      const rawId = item.id.length > 0 ? item.id : `${turn}-${step}-${nextToolIndex}`
+      if (completedToolCalls.has(rawId)) return
+      const argumentsText = serialized(item.input)
+      const existing = toolCalls.get(rawId)
+      if (existing !== undefined) {
+        appendToolArguments(existing, argumentsText)
+        return
+      }
       const callId = CallId(rawId)
       const name = item.name.length > 0 ? item.name : 'external_tool'
-      toolCalls.set(rawId, { callId, name })
-      const argumentsText = serialized(item.input)
+      const call = { callId, name, index: nextToolIndex++, argumentsText }
+      toolCalls.set(rawId, call)
       this.session.append('assistant/message', {
         turn,
         step,
@@ -309,21 +404,24 @@ export class ExternalEngineAgent implements Agent {
     }
 
     const appendToolResult = (item: Extract<AgentTimelineItem, { type: 'tool_call' }>): void => {
-      const rawId = item.id.length > 0 ? item.id : `${turn}-${step}-${toolCalls.size + 1}`
+      const rawId = item.id.length > 0 ? item.id : `${turn}-${step}-${nextToolIndex}`
+      if (completedToolCalls.has(rawId)) return
       let call = toolCalls.get(rawId)
       if (call === undefined) {
         const callId = CallId(rawId)
-        call = { callId, name: item.name.length > 0 ? item.name : 'external_tool' }
+        call = { callId, name: item.name.length > 0 ? item.name : 'external_tool', index: nextToolIndex++, argumentsText: serialized(item.input) }
         toolCalls.set(rawId, call)
         this.session.append('assistant/message', {
           turn,
           step,
           message: createAssistantMessage({
-            content: [{ type: 'tool-call', id: callId, name: call.name, arguments: serialized(item.input) }],
+            content: [{ type: 'tool-call', id: callId, name: call.name, arguments: call.argumentsText }],
             source: { provider: this.provider, model: this.model },
           }),
         }, { surfaceOp: 'append' })
-        this.session.append('tool/call', { turn, step, callId, name: call.name, arguments: serialized(item.input) })
+        this.session.append('tool/call', { turn, step, callId, name: call.name, arguments: call.argumentsText })
+      } else {
+        appendToolArguments(call, serialized(item.input))
       }
       this.session.append('tool/result', {
         turn,
@@ -334,7 +432,32 @@ export class ExternalEngineAgent implements Agent {
           isError: item.status === 'failed' || item.status === 'canceled',
         }),
       }, { surfaceOp: 'append' })
-      toolCalls.delete(rawId)
+      completedToolCalls.add(rawId)
+    }
+
+    const appendAssistantMessage = (interrupted = false): void => {
+      const content = assistantParts
+        .filter(part => part.text.length > 0)
+        .map(part => ({ type: part.type, text: part.text } as const))
+      if (content.length === 0) return
+      this.session.append('assistant/message', {
+        turn,
+        step,
+        message: createAssistantMessage({
+          content,
+          source: { provider: this.provider, model: this.model },
+        }),
+        ...(usage === undefined ? {} : { usage: sessionUsage(usage) }),
+        ...(interrupted ? { interrupted: true as const } : {}),
+      }, { surfaceOp: 'append', sourceEventSeqs: sourceChunkSeqs })
+    }
+
+    const settleCanceled = (reason: string): void => {
+      if (settled) return
+      appendAssistantMessage(true)
+      settled = true
+      unsubscribe()
+      result.resolve({ text, ...(usage === undefined ? {} : { usage }), canceled: true, reason })
     }
 
     const consume = (event: AgentStreamEvent): void => {
@@ -344,29 +467,34 @@ export class ExternalEngineAgent implements Agent {
       if (event.type === 'timeline') {
         const item = event.item
         if (item.type === 'assistant_message') {
-          if (item.text.length === 0) return
-          text += item.text
-          chunkSeqs.push(this.session.append('assistant/chunk', {
-            turn,
-            step,
-            chunk: { type: 'text-delta', index: 0, text: item.text },
-          }).seq)
+          appendText(item.text, item.partial === true)
+        } else if (item.type === 'reasoning') {
+          appendReasoning(item.text)
         } else if (item.type === 'tool_call') {
           if (item.status === 'running') appendToolCall(item)
           else appendToolResult(item)
         }
         return
       }
+      if (event.type === 'reasoning') {
+        appendReasoning(event.text)
+        return
+      }
+      if (event.type === 'usage_updated') {
+        appendUsage(event.usage)
+        return
+      }
       if (event.type === 'turn_completed') {
+        if (event.result !== undefined) appendText(event.result, false)
+        if (event.usage !== undefined) appendUsage(event.usage)
+        appendAssistantMessage()
         settled = true
         unsubscribe()
-        result.resolve({ text, chunkSeqs })
+        result.resolve({ text, ...(usage === undefined ? {} : { usage }) })
         return
       }
       if (event.type === 'turn_canceled') {
-        settled = true
-        unsubscribe()
-        result.resolve({ text, chunkSeqs, canceled: true, reason: event.reason })
+        settleCanceled(event.reason)
         return
       }
       if (event.type === 'turn_failed' || event.type === 'error') {
@@ -399,6 +527,10 @@ export class ExternalEngineAgent implements Agent {
     unsubscribe = this.runtime.onEvent(rawEvent => {
       const event = normalizeExternalEngineEvent(rawEvent, this.provider)
       if (event === undefined || settled) return
+      if (expectedRuntimeTurnId === undefined && 'turnId' in event && event.turnId !== undefined) {
+        expectedRuntimeTurnId = event.turnId
+        flushBuffered()
+      }
       if (expectedRuntimeTurnId === undefined) {
         bufferedEvents.push(event)
         return
@@ -407,8 +539,13 @@ export class ExternalEngineAgent implements Agent {
     })
 
     const bindRuntimeTurn = (runtimeTurnId: string): void => {
+      if (settled) return
       if (runtimeTurnId.trim() === '') {
         fail(new Error('external engine returned an empty turn id'))
+        return
+      }
+      if (expectedRuntimeTurnId !== undefined && expectedRuntimeTurnId !== runtimeTurnId) {
+        fail(new Error(`external engine returned turn id "${runtimeTurnId}" after streaming "${expectedRuntimeTurnId}"`))
         return
       }
       expectedRuntimeTurnId = runtimeTurnId
@@ -416,7 +553,8 @@ export class ExternalEngineAgent implements Agent {
     }
 
     const onAbort = (): void => {
-      fail(signal.reason instanceof Error ? signal.reason : new Error('External engine Agent turn aborted'))
+      const reason = signal.reason instanceof Error ? signal.reason.message : 'External engine Agent turn aborted'
+      settleCanceled(reason)
     }
     signal.addEventListener('abort', onAbort, { once: true })
     void this.runtime.process.exited.then(() => {

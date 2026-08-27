@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SessionStore from '@deepseek-ai/dsh-session'
@@ -8,6 +10,7 @@ import { createEngineSuiteRuntime } from '../src/engine-suite.js'
 import { EngineSuiteAgentService } from '../src/agent/service.js'
 import type { ClaudeAdapterEvent, ClaudeAgentSession, ClaudeAdapterOptions, ClaudeCatalog, ClaudeThinkingOption } from '../src/claude/types.js'
 import { createParentChildLineageStore, type ParentChildLineageDescriptor } from '../src/orchestration/lineage.js'
+import { ExternalEngineBindingStore } from '../src/engine/bindings.js'
 import { ClaudeSessionRuntimeBridge } from '../src/agent/runtime.js'
 
 const catalog: ClaudeCatalog = { models: [], commands: [], modes: [], skills: [], mcpServers: [], capabilities: [] }
@@ -75,6 +78,30 @@ function fakeCodexServer(): string {
     "process.stdin.on('data',chunk=>{buffer+=chunk;let newline;while((newline=buffer.indexOf(String.fromCharCode(10)))>=0){const line=buffer.slice(0,newline);buffer=buffer.slice(newline+1);if(line.trim())handle(JSON.parse(line));}});",
     "process.stdin.on('end',()=>process.exit(0));",
   ].join('')
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>
+  resolve(value: T): void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolvePromise!: (value: T) => void
+  const promise = new Promise<T>(resolveCurrent => { resolvePromise = resolveCurrent })
+  return { promise, resolve: resolvePromise }
+}
+
+class GatedChildBindingStore extends ExternalEngineBindingStore {
+  readonly childPutStarted = deferred<void>()
+  readonly releaseChildPut = deferred<void>()
+
+  override async put(value: Parameters<ExternalEngineBindingStore['put']>[0]): Promise<void> {
+    if (value.engineId === 'codex-cli') {
+      this.childPutStarted.resolve(undefined)
+      await this.releaseChildPut.promise
+    }
+    await super.put(value)
+  }
 }
 
 function registerCrossEngineProfiles(suite: ReturnType<typeof createEngineSuiteRuntime>): void {
@@ -149,6 +176,75 @@ test('Claude parent delegates a Codex child and supports resume/archive/detach a
     for (const handle of service.list()) await handle.dispose()
   }
   assert.equal(claudeSessions[0]?.model, 'glm-5.3')
+})
+
+test('child startup gates lifecycle operations until its binding is durable', async () => {
+  const root = await mkdtemp(join('/tmp', 'dsh-child-binding-race-'))
+  const bindings = new GatedChildBindingStore(join(root, 'engine-bindings.json'))
+  const suite = createEngineSuiteRuntime({ claudeSessionFactory: options => new CompletingClaudeSession(options, 'claude-race-parent') })
+  registerCrossEngineProfiles(suite)
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  const service = new EngineSuiteAgentService(ctx, suite, () => 'test-key', bindings)
+  const parent = await service.createExternal({ sessionId: 'race-parent-session', selection: suite.profiles.get('claude-parent').selection, apiKey: 'test-key', cwd: '/tmp' })
+  try {
+    const pending = service.delegate('race-parent-session', {
+      profileId: 'codex-child',
+      task: 'deterministic binding race',
+      executable: process.execPath,
+      args: ['-e', fakeCodexServer()],
+    })
+    await bindings.childPutStarted.promise
+    const starting = service.listLineages('race-parent-session')[0]
+    assert.ok(starting)
+    assert.equal(starting.status, 'starting')
+    await assert.rejects(service.resumeChild(starting.childSessionId), /while it is starting/u)
+    await assert.rejects(service.detachChild(starting.childSessionId), /while it is starting/u)
+    await assert.rejects(service.archiveChild(starting.childSessionId), /while it is starting/u)
+
+    bindings.releaseChildPut.resolve(undefined)
+    const created = await pending
+    assert.equal(created.lineage.status, 'completed')
+    const stored = await bindings.get(created.lineage.childSessionId)
+    assert.ok(stored)
+    assert.equal(stored.nativeSessionId, 'urn:uuid:00000000-0000-4000-8000-000000000001')
+    await created.handle.dispose()
+  } finally {
+    bindings.releaseChildPut.resolve(undefined)
+    await parent.dispose()
+    for (const handle of service.list()) await handle.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('concurrent child reservations retain every published child for parent teardown', async () => {
+  const root = await mkdtemp(join('/tmp', 'dsh-child-reservation-race-'))
+  const bindings = new GatedChildBindingStore(join(root, 'engine-bindings.json'))
+  const suite = createEngineSuiteRuntime({ claudeSessionFactory: options => new CompletingClaudeSession(options, 'claude-reservation-parent') })
+  registerCrossEngineProfiles(suite)
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  const service = new EngineSuiteAgentService(ctx, suite, () => 'test-key', bindings)
+  const parent = await service.createExternal({ sessionId: 'reservation-parent-session', selection: suite.profiles.get('claude-parent').selection, apiKey: 'test-key', cwd: '/tmp' })
+  try {
+    const first = service.delegate('reservation-parent-session', { profileId: 'codex-child', task: 'first concurrent child', executable: process.execPath, args: ['-e', fakeCodexServer()] })
+    await bindings.childPutStarted.promise
+    const second = service.delegate('reservation-parent-session', { profileId: 'codex-child', task: 'second concurrent child', executable: process.execPath, args: ['-e', fakeCodexServer()] })
+    assert.equal(service.listLineages('reservation-parent-session').length, 2)
+    bindings.releaseChildPut.resolve(undefined)
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    assert.equal(firstResult.lineage.status, 'completed')
+    assert.equal(secondResult.lineage.status, 'completed')
+    await parent.dispose()
+    assert.equal(service.list().length, 0)
+  } finally {
+    bindings.releaseChildPut.resolve(undefined)
+    await parent.dispose()
+    for (const handle of service.list()) await handle.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('ParentChildLineage replays every lifecycle transition and rejects late terminal events', () => {

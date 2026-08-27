@@ -299,7 +299,8 @@ function timelineItemFrom(value: unknown): AgentTimelineItem | undefined {
   }
   if (type === "reasoning") {
     const text = fieldString(input, "text");
-    return text === undefined ? undefined : { type, text, ...(metadata === undefined ? {} : { metadata }) };
+    const partial = fieldBoolean(input, "partial");
+    return text === undefined ? undefined : { type, text, ...(partial === undefined ? {} : { partial }), ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "error") {
     const message = fieldString(input, "message");
@@ -311,6 +312,7 @@ function timelineItemFrom(value: unknown): AgentTimelineItem | undefined {
   const status = fieldString(input, "status");
   if (id === undefined || name === undefined || (status !== "running" && status !== "completed" && status !== "failed" && status !== "canceled")) return undefined;
   const error = fieldString(input, "error");
+  const partial = fieldBoolean(input, "partial");
   return {
     type,
     id,
@@ -319,6 +321,7 @@ function timelineItemFrom(value: unknown): AgentTimelineItem | undefined {
     ...(Object.prototype.hasOwnProperty.call(input, "input") ? { input: input["input"] } : {}),
     ...(Object.prototype.hasOwnProperty.call(input, "output") ? { output: input["output"] } : {}),
     ...(error === undefined ? {} : { error }),
+    ...(partial === undefined ? {} : { partial }),
     ...(metadata === undefined ? {} : { metadata }),
   };
 }
@@ -488,8 +491,9 @@ export function normalizeExternalEngineEvent(value: unknown, provider: AgentProv
     const usage = usageFrom(usageValue, input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"]);
     const failureMessage = errorMessageFrom(input["error"], "external engine turn failed");
     const failureMetadata = errorMetadataFrom(input["errorDetails"] ?? input["error"], failureMessage);
+    const result = fieldString(input, "result");
     const event: AgentStreamEvent = status === "completed"
-      ? { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }) }
+      ? { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }), ...(result === undefined ? {} : { result }) }
       : { type: "turn_failed", provider, error: failureMessage, ...(failureMetadata === undefined ? {} : { metadata: failureMetadata }) };
     return withTurn(event, turnId);
   }
@@ -508,7 +512,14 @@ export function normalizeExternalEngineEvent(value: unknown, provider: AgentProv
     const usageValue = input["usage"] ?? input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"];
     const usage = usageFrom(usageValue, input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"]);
     const metadata = metadataFrom(input["metadata"]);
-    const event: AgentStreamEvent = { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }), ...(metadata === undefined ? {} : { metadata }) };
+    const result = fieldString(input, "result");
+    const event: AgentStreamEvent = {
+      type: "turn_completed",
+      provider,
+      ...(usage === undefined ? {} : { usage }),
+      ...(result === undefined ? {} : { result }),
+      ...(metadata === undefined ? {} : { metadata }),
+    };
     return withTurn(event, turnId);
   }
   if (type === "turn_failed") {
@@ -551,6 +562,13 @@ export function normalizeExternalEngineEvent(value: unknown, provider: AgentProv
     if (usage === undefined) return undefined;
     const metadata = metadataFrom(input["metadata"]);
     const event: AgentStreamEvent = { type: "usage_updated", provider, usage, ...(metadata === undefined ? {} : { metadata }) };
+    return withTurn(event, turnId);
+  }
+  if (type === "status_changed" || type === "status" || type === "working") {
+    const status = fieldString(input, "status") ?? fieldString(input, "value") ?? (type === "working" ? "working" : undefined);
+    if (status === undefined) return undefined;
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "status_changed", provider, status, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "permission_requested") {
@@ -664,6 +682,7 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   private readonly resolveProcessExited: () => void
   readonly process: { readonly exited: Promise<void>; readonly stderrTail: string }
   private readonly partialAssistantTurns = new Set<string>()
+  private readonly partialReasoningTurns = new Set<string>()
   private readonly terminalTurns = new Set<string>()
   private suppressUnscopedEvents = false
   private readonly listeners = new Set<ExternalEngineEventHandler>();
@@ -671,6 +690,8 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   private activeTurnId: string | undefined;
   private interruptTurnId: string | undefined;
   private interruptPromise: Promise<void> | undefined;
+  private interruptPendingBeforeTurn = false;
+  private turnStartPending = false;
   private closed = false;
 
   constructor(readonly session: ClaudeAgentSession) {
@@ -684,8 +705,16 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
         if (this.terminalTurns.has(event.turnId)) return;
         this.activeTurnId = event.turnId;
         this.suppressUnscopedEvents = false;
-        this.interruptTurnId = undefined;
-        this.interruptPromise = undefined;
+        const interruptBeforeTurn = this.interruptPendingBeforeTurn;
+        if (interruptBeforeTurn) {
+          this.interruptPendingBeforeTurn = false;
+          this.interruptTurnId = event.turnId;
+          this.interruptPromise = this.session.interrupt();
+          void this.interruptPromise.catch(() => {});
+        } else {
+          this.interruptTurnId = undefined;
+          this.interruptPromise = undefined;
+        }
       } else if (eventTurnId !== undefined && this.terminalTurns.has(eventTurnId)) {
         return;
       } else if (eventTurnId === undefined && this.suppressUnscopedEvents && event.type !== "process_exited") {
@@ -719,15 +748,31 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   }
 
   async startTurn(text: string, _signal?: AbortSignal): Promise<{ readonly id: string }> {
-    const result = await this.session.startTurn(text);
-    this.activeTurnId = this.terminalTurns.has(result.turnId) ? undefined : result.turnId;
-    this.interruptTurnId = undefined;
-    this.interruptPromise = undefined;
-    return { id: result.turnId };
+    this.interruptPendingBeforeTurn = false;
+    this.turnStartPending = true;
+    try {
+      const result = await this.session.startTurn(text).catch(error => {
+        this.interruptPendingBeforeTurn = false;
+        throw error;
+      });
+      this.activeTurnId = this.terminalTurns.has(result.turnId) ? undefined : result.turnId;
+      if (!this.interruptPendingBeforeTurn) {
+        this.interruptTurnId = undefined;
+        this.interruptPromise = undefined;
+      }
+      return { id: result.turnId };
+    } finally {
+      this.turnStartPending = false;
+    }
   }
 
   async interrupt(_signal?: AbortSignal): Promise<void> {
-    if (this.closed || this.activeTurnId === undefined) return;
+    if (this.closed) return;
+    if (this.activeTurnId === undefined && this.turnStartPending) {
+      this.interruptPendingBeforeTurn = true;
+      return;
+    }
+    if (this.activeTurnId === undefined) return;
     if (this.interruptTurnId === this.activeTurnId && this.interruptPromise !== undefined) {
       await this.interruptPromise;
       return;
@@ -742,6 +787,12 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
+    this.activeTurnId = undefined;
+    this.interruptTurnId = undefined;
+    this.interruptPromise = undefined;
+    this.interruptPendingBeforeTurn = false;
+    this.partialAssistantTurns.clear();
+    this.partialReasoningTurns.clear();
     await this.session.close();
     this.resolveProcessExited();
   }
@@ -758,23 +809,41 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
         if (event.item.type === "assistant_message" && event.item.partial !== true && event.turnId !== undefined && this.partialAssistantTurns.has(event.turnId)) {
           return undefined
         }
+        if (event.item.type === "reasoning" && event.item.partial === true && event.turnId !== undefined) {
+          this.partialReasoningTurns.add(event.turnId)
+        }
+        if (event.item.type === "reasoning" && event.item.partial !== true && event.turnId !== undefined && this.partialReasoningTurns.has(event.turnId)) {
+          return undefined
+        }
         const item = this.timeline(event.item);
         return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item };
       }
       case "usage_updated": return { type: "usage_updated", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), usage: toUsage(event.usage) };
       case "permission_requested": return { type: "permission_requested", provider, request: toPermission(event.request) };
-      case "status_changed": return undefined;
+      case "status_changed": {
+        const metadata = metadataFrom(event.metadata)
+        return { type: "status_changed", provider, status: event.status, ...(metadata === undefined ? {} : { metadata }) };
+      }
       case "turn_completed": {
         if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
-        return { type: "turn_completed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), ...(event.usage === undefined ? {} : { usage: toUsage(event.usage) }) };
+        if (event.turnId !== undefined) this.partialReasoningTurns.delete(event.turnId)
+        return {
+          type: "turn_completed",
+          provider,
+          ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+          ...(event.usage === undefined ? {} : { usage: toUsage(event.usage) }),
+          ...(event.result === undefined ? {} : { result: event.result }),
+        };
       }
       case "turn_failed": {
         if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
+        if (event.turnId !== undefined) this.partialReasoningTurns.delete(event.turnId)
         const metadata: AgentEventMetadata = { error: { message: event.error } };
         return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error, metadata };
       }
       case "turn_canceled": {
         if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
+        if (event.turnId !== undefined) this.partialReasoningTurns.delete(event.turnId)
         return { type: "turn_canceled", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), reason: "canceled" };
       }
       default: return undefined;
@@ -791,9 +860,9 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
         ? { error: { message: typeof value.output === "string" ? value.output : "external tool failed" } }
         : undefined;
       const combined = mergeMetadata(metadata, toolMetadata);
-      return { type: "tool_call", id: value.id ?? "", name: value.name ?? "external_tool", status: value.type === "tool_result" ? (value.isError ? "failed" : "completed") : "running", ...(input === undefined ? {} : { input }), ...(value.output === undefined ? {} : { output: value.output }), ...(combined === undefined ? {} : { metadata: combined }) };
+      return { type: "tool_call", id: value.id ?? "", name: value.name ?? "external_tool", status: value.type === "tool_result" ? (value.isError ? "failed" : "completed") : "running", ...(input === undefined ? {} : { input }), ...(value.output === undefined ? {} : { output: value.output }), ...(value.partial === undefined ? {} : { partial: value.partial }), ...(combined === undefined ? {} : { metadata: combined }) };
     }
-    if (value.type === "reasoning") return { type: "reasoning", text: value.text ?? "", ...(metadata === undefined ? {} : { metadata }) };
+    if (value.type === "reasoning") return { type: "reasoning", text: value.text ?? "", ...(value.partial === undefined ? {} : { partial: value.partial }), ...(metadata === undefined ? {} : { metadata }) };
     if (value.type === "compaction") return { type: "compaction", status: "completed", ...(metadata === undefined ? {} : { metadata }) };
     if (value.type === "status") return { type: "error", message: value.text ?? "", ...(metadata === undefined ? {} : { metadata }) };
     return { type: "assistant_message", text: value.text ?? "", ...(value.partial === undefined ? {} : { partial: value.partial }), ...(metadata === undefined ? {} : { metadata }) };

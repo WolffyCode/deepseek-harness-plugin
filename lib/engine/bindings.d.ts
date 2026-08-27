@@ -18,6 +18,7 @@ export declare class ExternalEngineBindingStore {
     runtimeRoot(sessionId: string): string;
     get(sessionId: string): Promise<ExternalEngineBinding | undefined>;
     put(binding: ExternalEngineBinding): Promise<void>;
+    remove(sessionId: string): Promise<void>;
     private read;
     private write;
 }

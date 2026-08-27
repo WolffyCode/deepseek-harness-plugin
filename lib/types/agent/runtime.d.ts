@@ -33,6 +33,7 @@ export declare class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime
         readonly stderrTail: string;
     };
     private readonly partialAssistantTurns;
+    private readonly partialReasoningTurns;
     private readonly terminalTurns;
     private suppressUnscopedEvents;
     private readonly listeners;
@@ -40,6 +41,8 @@ export declare class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime
     private activeTurnId;
     private interruptTurnId;
     private interruptPromise;
+    private interruptPendingBeforeTurn;
+    private turnStartPending;
     private closed;
     constructor(session: ClaudeAgentSession);
     get turnId(): string | undefined;

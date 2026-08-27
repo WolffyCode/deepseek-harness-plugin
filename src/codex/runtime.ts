@@ -94,6 +94,20 @@ function startupTimeoutMs(value: number | undefined): number {
   return timeout
 }
 
+function deferred<T>(): {
+  readonly promise: Promise<T>
+  readonly resolve: (value: T | PromiseLike<T>) => void
+  readonly reject: (error: Error) => void
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+  return { promise, resolve, reject }
+}
+
 function safeErrorMessage(error: JsonValue | undefined, fallback = 'Codex turn failed'): string {
   if (typeof error === 'string' && error.length > 0) return error
   const details = recordField(error)
@@ -216,7 +230,11 @@ export class CodexRuntime {
   private closed = false
   private closePromise: Promise<ProcessExit> | undefined
   private readonly turnStatuses = new Map<string, TurnStatus>()
+  private readonly startedTurnIds = new Set<string>()
+  private readonly terminalThreadIds = new Set<string>()
   private readonly eventListeners = new Set<ExternalEngineEventHandler>()
+  private pendingTurnStart: { readonly resolve: (turn: CodexTurn) => void; readonly reject: (error: Error) => void } | undefined
+  private interruptPendingBeforeTurn = false
 
   private constructor(
     process: CodexProcess,
@@ -276,6 +294,24 @@ export class CodexRuntime {
     for (const listener of [...this.eventListeners]) listener(event)
   }
 
+  private adoptTurn(turnId: string, emitStarted = true): CodexTurn {
+    const turn = { id: turnId }
+    this.turn = turn
+    const firstObservation = !this.startedTurnIds.has(turnId)
+    if (firstObservation) {
+      this.startedTurnIds.add(turnId)
+      this.turnStatuses.set(turnId, 'inProgress')
+      if (emitStarted) this.emit({ type: 'turn_started', turnId, status: 'inProgress' })
+    }
+    this.pendingTurnStart?.resolve(turn)
+    this.pendingTurnStart = undefined
+    if (this.interruptPendingBeforeTurn) {
+      this.interruptPendingBeforeTurn = false
+      void this.interrupt().catch(() => {})
+    }
+    return turn
+  }
+
   private turnIdFor(params: JsonObject | undefined, item?: JsonObject): string | undefined {
     const turn = recordField(params?.['turn'])
     return stringField(params?.['turnId']) ?? stringField(turn?.['id']) ?? stringField(item?.['turnId'])
@@ -332,15 +368,21 @@ export class CodexRuntime {
     const turnId = this.turnIdFor(params)
     const status = turnStatus(turn?.['status']) ?? 'inProgress'
     if (turnId === undefined || this.isTerminal(turnId)) return
+    const threadId = stringField(params['threadId'])
+    if (threadId !== undefined) this.terminalThreadIds.delete(threadId)
+    const firstObservation = !this.startedTurnIds.has(turnId)
+    this.adoptTurn(turnId, false)
     this.turnStatuses.set(turnId, status)
-    this.emit({ type: 'turn_started', turnId, status, ...turn === undefined ? {} : { turn } })
+    if (firstObservation) this.emit({ type: 'turn_started', turnId, status, ...turn === undefined ? {} : { turn } })
   }
 
   private projectTurnCompleted(params: JsonObject): void {
     const turn = recordField(params['turn'])
     const turnId = this.turnIdFor(params)
     if (turnId === undefined || this.isTerminal(turnId)) return
+    if (this.turn === undefined || this.turn.id !== turnId) this.adoptTurn(turnId)
     const status = turnStatus(turn?.['status']) ?? 'failed'
+    const threadId = stringField(params['threadId'])
     this.turnStatuses.set(turnId, status)
     const error = turn?.['error']
     const preservedStatus = stringField(turn?.['status']) ?? status
@@ -351,17 +393,22 @@ export class CodexRuntime {
         ? canonicalUsage(rawUsage)
         : rawUsage
     if (status === 'completed') {
+      if (threadId !== undefined) this.terminalThreadIds.add(threadId)
       this.emit({ type: 'turn_completed', turnId, status: preservedStatus, ...usage === undefined ? {} : { usage }, ...turn === undefined ? {} : { turn } })
+      if (this.turn?.id === turnId) this.turn = undefined
       return
     }
     if (status === 'interrupted') {
+      if (threadId !== undefined) this.terminalThreadIds.add(threadId)
       this.emit({ type: 'turn_canceled', turnId, reason: safeErrorMessage(error, 'Codex turn interrupted'), status: preservedStatus, ...turn === undefined ? {} : { turn } })
+      if (this.turn?.id === turnId) this.turn = undefined
       return
     }
     if (status === 'inProgress') {
       this.emit({ type: 'turn_started', turnId, status, ...turn === undefined ? {} : { turn } })
       return
     }
+    if (threadId !== undefined) this.terminalThreadIds.add(threadId)
     const errorDetails = recordField(error)
     const codexErrorInfo = recordField(errorDetails?.['codexErrorInfo'])
     const code = stringField(errorDetails?.['code']) ?? stringField(codexErrorInfo?.['code'])
@@ -376,6 +423,7 @@ export class CodexRuntime {
       status: preservedStatus,
       ...turn === undefined ? {} : { turn },
     })
+    if (this.turn?.id === turnId) this.turn = undefined
   }
 
   private handleNotification(method: string, rawParams: JsonValue | undefined): void {
@@ -388,6 +436,11 @@ export class CodexRuntime {
     }
     const item = recordField(params['item'])
     const eventTurnId = this.turnIdFor(params, item)
+    const threadId = stringField(params['threadId'])
+    if (eventTurnId !== undefined && this.turn === undefined && !this.isTerminal(eventTurnId)) {
+      if (threadId !== undefined) this.terminalThreadIds.delete(threadId)
+      this.adoptTurn(eventTurnId)
+    }
     if (method === 'turn/started') {
       this.projectTurnStarted(params)
       return
@@ -452,6 +505,7 @@ export class CodexRuntime {
       this.emit({ type: 'process-exited', ...(stringField(params['processId']) === undefined ? {} : { processId: stringField(params['processId']) }), ...(numberField(params['exitCode']) === undefined ? {} : { exitCode: numberField(params['exitCode']) }), ...(stringField(params['signal']) === undefined ? {} : { signal: stringField(params['signal']) }), ...(stringField(params['status']) === undefined ? {} : { status: stringField(params['status']) }) })
       return
     }
+    if (threadId !== undefined && this.turn === undefined && this.terminalThreadIds.has(threadId)) return
     this.emitUnknownNotification(method, params)
   }
 
@@ -505,14 +559,34 @@ export class CodexRuntime {
   async startTurn(text: string, signal?: AbortSignal): Promise<CodexTurn> {
     if (this.thread === undefined) throw new Error('cannot start a turn before a thread exists')
     if (text.trim() === '') throw new Error('turn text must not be empty')
-    const response = await this.transport.request('turn/start', {
+    if (this.pendingTurnStart !== undefined) throw new Error('Codex turn start is already pending')
+    this.interruptPendingBeforeTurn = false
+    const start = deferred<CodexTurn>()
+    this.pendingTurnStart = { resolve: start.resolve, reject: start.reject }
+    const response = this.transport.request('turn/start', {
       threadId: this.thread.id,
       input: [{ type: 'text', text, text_elements: [] }],
       ...this.options.model === undefined ? {} : { model: this.options.model },
       ...this.options.reasoningEffort === undefined ? {} : { effort: this.options.reasoningEffort },
     }, signal)
-    this.turn = turnFrom(response)
-    return this.turn
+    void response.then(
+      value => {
+        const turn = turnFrom(value)
+        if (this.isTerminal(turn.id)) {
+          this.pendingTurnStart?.resolve(turn)
+          this.pendingTurnStart = undefined
+          return
+        }
+        if (this.turn === undefined || this.turn.id !== turn.id) this.adoptTurn(turn.id)
+        else this.pendingTurnStart?.resolve(turn)
+      },
+      error => {
+        const failure = error instanceof Error ? error : new Error(String(error))
+        this.pendingTurnStart?.reject(failure)
+        this.pendingTurnStart = undefined
+      },
+    )
+    return start.promise
   }
 
   async steer(text: string, signal?: AbortSignal): Promise<JsonValue> {
@@ -526,7 +600,11 @@ export class CodexRuntime {
   }
 
   async interrupt(signal?: AbortSignal): Promise<JsonValue> {
-    if (this.thread === undefined || this.turn === undefined) return null
+    if (this.thread === undefined) return null
+    if (this.turn === undefined) {
+      if (this.pendingTurnStart !== undefined) this.interruptPendingBeforeTurn = true
+      return null
+    }
     return this.transport.request('turn/interrupt', {
       threadId: this.thread.id,
       turnId: this.turn.id,
@@ -536,6 +614,10 @@ export class CodexRuntime {
   async close(): Promise<ProcessExit> {
     if (this.closePromise !== undefined) return this.closePromise
     this.closed = true
+    this.pendingTurnStart?.reject(new Error('Codex runtime is closed'))
+    this.pendingTurnStart = undefined
+    this.interruptPendingBeforeTurn = false
+    this.turn = undefined
     this.transport.close()
     this.closePromise = this.process.dispose()
     return this.closePromise

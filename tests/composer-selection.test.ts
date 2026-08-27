@@ -22,6 +22,13 @@ const catalog: EngineSuiteCatalogView = {
   mcpSets: [],
 }
 
+const threeKernelCatalog: EngineSuiteCatalogView = {
+  ...catalog,
+  engines: [...catalog.engines, { id: 'deepseek-native', type: 'deepseek-native', displayName: 'DeepSeek', capabilities: {} as never }],
+  providers: [...catalog.providers, { id: 'deepseek-native', engineId: 'deepseek-native', name: 'DeepSeek 内置', baseUri: '', wireApi: 'responses', authMode: 'api-key', enabled: true, status: 'available' }],
+  models: [...catalog.models, { id: 'deepseek-native/deepseek-chat', engineId: 'deepseek-native', providerId: 'deepseek-native', modelId: 'deepseek-chat', displayName: 'DeepSeek Chat', enabled: true, hidden: false, reasoningOptions: [{ id: 'default' }], defaultReasoningEffort: 'default', inputModalities: ['text'], contextWindowSource: 'manual', source: 'manual' }],
+}
+
 test('engine selection is editable only for a blank session', () => {
   assert.equal(engineSelectionLocked(false, true), false)
   assert.equal(engineSelectionLocked(false, false), true)
@@ -74,4 +81,16 @@ test('composer search filters engines, providers, and models without changing ca
   assert.deepEqual(filterProviderOptions(catalog.providers, 'openCode').map(provider => provider.id), ['glm-opencodebay', 'codex-opencodebay'])
   assert.deepEqual(filterModelOptions(catalog.models, 'GPT').map(model => model.id), ['codex-opencodebay/gpt-5.2'])
   assert.equal(filterEngineOptions(catalog.engines, '   ').length, catalog.engines.length)
+})
+
+test('catalog keeps DeepSeek, Claude, and Codex on one selection contract', () => {
+  assert.deepEqual(resolveEngineSelection(threeKernelCatalog, 'deepseek-native'), {
+    engineId: 'deepseek-native',
+    providerId: 'deepseek-native',
+    modelRecordId: 'deepseek-native/deepseek-chat',
+    reasoningEffort: 'default',
+  })
+  assert.equal(enabledProviders(catalog, 'claude-cli').length, 1)
+  assert.equal(enabledProviders(catalog, 'codex-cli').length, 1)
+  assert.equal(enabledProviders(threeKernelCatalog, 'deepseek-native').length, 1)
 })

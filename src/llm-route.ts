@@ -1,5 +1,5 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, LlmRuntime, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AdapterRegistrationHandle, GenerateOptions, LlmModelInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, LlmRuntime, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { EngineSuiteRuntime } from './engine-suite.js'
 
 /**
@@ -25,11 +25,22 @@ class ExternalEngineRouteAdapter extends LlmAdapter {
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     const record = this.suite.models.list(provider).find(candidate => candidate.modelId === model)
+    const reasoning = record === undefined || record.reasoningOptions.length === 0
+      ? undefined
+      : {
+        efforts: record.reasoningOptions.map(option => ({
+          id: option.id as LlmReasoningEffortInfo['id'],
+          name: option.id,
+          ...option.description === undefined ? {} : { description: option.description },
+        })),
+        ...record.defaultReasoningEffort === undefined ? {} : { defaultEffort: record.defaultReasoningEffort as LlmReasoningEffortInfo['id'] },
+      }
     return Promise.resolve({
       provider,
       id: model,
       name: record?.displayName ?? model,
       ...record?.description === undefined ? {} : { description: record.description },
+      ...reasoning === undefined ? {} : { reasoning },
     })
   }
 

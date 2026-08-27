@@ -80,6 +80,48 @@ test('CodexRuntime performs initialize, thread/start, turn/start and close', asy
   assert.equal(exit.signal, null)
 })
 
+test('CodexRuntime resolves turn start from the first live turn event', async () => {
+  const script = [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n');",
+    "else if(m.method==='thread/start') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{thread:{id:'thread-live',ephemeral:false}}})+'\\n');",
+    "else if(m.method==='turn/start'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'turn/started',params:{turn:{id:'turn-live',status:'inProgress'}}})+'\\n'); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'turn-live',delta:'live'}})+'\\n'),5); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'turn-live',status:'completed'}}})+'\\n'),15); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{turn:{id:'turn-live'}}})+'\\n'),250);}",
+    "});",
+  ].join('')
+  const runtime = await CodexRuntime.open({
+    executable: process.execPath,
+    args: ['-e', script],
+    cwd: process.cwd(),
+    disposeGraceMs: 100,
+  })
+  const events: unknown[] = []
+  let resolveComplete!: () => void
+  const complete = new Promise<void>(resolve => { resolveComplete = resolve })
+  const off = runtime.onEvent(event => {
+    events.push(event)
+    if (typeof event === 'object' && event !== null && (event as { type?: string }).type === 'turn_completed') resolveComplete()
+  })
+  try {
+    await runtime.startThread()
+    const start = runtime.startTurn('live now')
+    const turn = await Promise.race([
+      start,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('turn start did not resolve from live event')), 100)),
+    ])
+    assert.equal(turn.id, 'turn-live')
+    await Promise.race([
+      complete,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('turn did not complete')), 100)),
+    ])
+    assert.deepEqual(events.filter(event => typeof event === 'object' && event !== null && (event as { type?: string }).type === 'turn_started').length, 1)
+    assert.equal(events.some(event => typeof event === 'object' && event !== null && (event as { type?: string }).type === 'turn_completed'), true)
+  } finally {
+    off()
+    await runtime.close()
+  }
+})
+
 test('CodexRuntime bounds startup and cleans the child process on timeout', async () => {
   const script = [
     "const rl=require('node:readline').createInterface({input:process.stdin});",

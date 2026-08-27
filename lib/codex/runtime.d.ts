@@ -30,13 +30,18 @@ export declare class CodexRuntime {
     private closed;
     private closePromise;
     private readonly turnStatuses;
+    private readonly startedTurnIds;
+    private readonly terminalThreadIds;
     private readonly eventListeners;
+    private pendingTurnStart;
+    private interruptPendingBeforeTurn;
     private constructor();
     static open(options: CodexRuntimeOptions): Promise<CodexRuntime>;
     get threadId(): string | undefined;
     get turnId(): string | undefined;
     onEvent(handler: ExternalEngineEventHandler): () => void;
     private emit;
+    private adoptTurn;
     private turnIdFor;
     private isTerminal;
     private emitUnknownNotification;

@@ -223,7 +223,7 @@ export type AgentTimelineItem =
       readonly partial?: boolean;
       readonly metadata?: AgentEventMetadata;
     }
-  | { readonly type: "reasoning"; readonly text: string; readonly metadata?: AgentEventMetadata }
+  | { readonly type: "reasoning"; readonly text: string; readonly partial?: boolean; readonly metadata?: AgentEventMetadata }
   | {
       readonly type: "tool_call";
       readonly id: string;
@@ -232,6 +232,8 @@ export type AgentTimelineItem =
       readonly input?: unknown;
       readonly output?: unknown;
       readonly error?: string;
+      /** True while the provider is still extending the raw tool arguments. */
+      readonly partial?: boolean;
       readonly metadata?: AgentEventMetadata;
     }
   | { readonly type: "todo"; readonly items: readonly AgentTodoItem[]; readonly metadata?: AgentEventMetadata }
@@ -280,7 +282,14 @@ export interface ProviderSubagentEvent {
 export type AgentStreamEvent =
   | { readonly type: "thread_started"; readonly provider: AgentProvider; readonly sessionId: string; readonly metadata?: AgentEventMetadata }
   | { readonly type: "turn_started"; readonly provider: AgentProvider; readonly turnId?: string; readonly metadata?: AgentEventMetadata }
-  | { readonly type: "turn_completed"; readonly provider: AgentProvider; readonly turnId?: string; readonly usage?: AgentUsage; readonly metadata?: AgentEventMetadata }
+  | {
+      readonly type: "turn_completed";
+      readonly provider: AgentProvider;
+      readonly turnId?: string;
+      readonly usage?: AgentUsage;
+      readonly result?: string;
+      readonly metadata?: AgentEventMetadata;
+    }
   | {
       readonly type: "turn_failed";
       readonly provider: AgentProvider;
@@ -300,6 +309,13 @@ export type AgentStreamEvent =
       readonly metadata?: AgentEventMetadata;
     }
   | { readonly type: "reasoning"; readonly provider: AgentProvider; readonly turnId?: string; readonly text: string; readonly metadata?: AgentEventMetadata }
+  | {
+      readonly type: "status_changed";
+      readonly provider: AgentProvider;
+      readonly turnId?: string;
+      readonly status: string;
+      readonly metadata?: AgentEventMetadata;
+    }
   | { readonly type: "usage_updated"; readonly provider: AgentProvider; readonly turnId?: string; readonly usage: AgentUsage; readonly metadata?: AgentEventMetadata }
   | {
       readonly type: "permission_requested";

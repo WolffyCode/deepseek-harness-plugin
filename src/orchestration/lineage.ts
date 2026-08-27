@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-export type ParentChildLineageStatus = 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached'
+export type ParentChildLineageStatus = 'starting' | 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached'
 export type ParentChildLineageEventType = 'create' | 'start' | 'progress' | 'result' | 'failure' | 'cancel' | 'archive' | 'detach' | 'resume'
 export type ParentChildLineageTerminalStatus = 'completed' | 'failed' | 'canceled' | 'archived'
 
@@ -65,7 +65,7 @@ function executionTerminal(status: ParentChildLineageStatus): ParentChildLineage
 
 function validateDescriptor(input: ParentChildLineageDescriptor): ParentChildLineageDescriptor {
   if (!Number.isSafeInteger(input.depth) || input.depth < 1) throw new RangeError('lineage depth must be a positive safe integer')
-  if (input.status !== 'running' && input.status !== 'completed' && input.status !== 'failed' && input.status !== 'canceled' && input.status !== 'archived' && input.status !== 'detached') throw new TypeError('invalid lineage status')
+  if (input.status !== 'starting' && input.status !== 'running' && input.status !== 'completed' && input.status !== 'failed' && input.status !== 'canceled' && input.status !== 'archived' && input.status !== 'detached') throw new TypeError('invalid lineage status')
   const terminalStatus = input.terminalStatus ?? executionTerminal(input.status)
   if (terminalStatus !== undefined && terminalStatus !== 'completed' && terminalStatus !== 'failed' && terminalStatus !== 'canceled' && terminalStatus !== 'archived') throw new TypeError('invalid lineage terminal status')
   return {
@@ -111,29 +111,33 @@ function transitionDescriptor(current: ParentChildLineageDescriptor, type: Paren
   const terminal = eventTerminalStatus(type)
   if (type === 'create') return cloneDescriptor(current)
   if (type === 'start') {
-    if (current.status !== 'running' || current.terminalStatus !== undefined) throw new Error(`cannot start lineage in ${current.status} state`)
-    return { ...current, updatedAt: timestamp }
+    if ((current.status !== 'starting' && current.status !== 'running') || current.terminalStatus !== undefined) throw new Error(`cannot start lineage in ${current.status} state`)
+    return { ...current, status: 'running', updatedAt: timestamp }
   }
   if (type === 'progress') {
     if ((current.status !== 'running' && current.status !== 'detached') || current.terminalStatus !== undefined) throw new Error(`cannot append progress to ${current.status} lineage`)
     return { ...current, updatedAt: timestamp }
   }
   if (type === 'resume') {
+    if (current.status === 'starting') throw new Error('cannot resume lineage while it is starting')
     if (current.status === 'archived') throw new Error('cannot resume archived lineage')
     const { terminalStatus: _terminalStatus, ...active } = current
     return { ...active, status: 'running', updatedAt: timestamp }
   }
   if (type === 'detach') {
+    if (current.status === 'starting') throw new Error('cannot detach lineage while it is starting')
     if (current.status === 'archived') throw new Error('cannot detach archived lineage')
     return { ...current, status: 'detached', updatedAt: timestamp }
   }
   if (type === 'archive') {
+    if (current.status === 'starting') throw new Error('cannot archive lineage while it is starting')
     if (current.status === 'archived') throw new Error('lineage is already archived')
     return { ...current, status: 'archived', terminalStatus: 'archived', updatedAt: timestamp }
   }
   if (terminal === undefined) throw new Error(`unsupported lineage transition ${type}`)
   if (current.terminalStatus !== undefined) throw new Error(`lineage is already terminal: ${current.terminalStatus}`)
-  if (current.status !== 'running' && current.status !== 'detached') throw new Error(`cannot finish lineage in ${current.status} state`)
+  if (current.status !== 'starting' && current.status !== 'running' && current.status !== 'detached') throw new Error(`cannot finish lineage in ${current.status} state`)
+  if (type === 'result' && current.status === 'starting') throw new Error('cannot complete lineage while it is starting')
   return { ...current, status: terminal, terminalStatus: terminal, updatedAt: timestamp }
 }
 
@@ -191,7 +195,7 @@ export function createParentChildLineageStore(file = defaultFile(), initial?: Pa
     const hasEvents = [...events.values()].some(list => list.some(event => event.childSessionId === descriptor.childSessionId))
     if (!hasEvents) continue
     const { terminalStatus: _terminalStatus, ...base } = descriptor
-    descriptors.set(descriptor.childSessionId, { ...base, status: 'running', ...(descriptor.createdAt ?? descriptor.updatedAt) === undefined ? {} : { updatedAt: descriptor.createdAt ?? descriptor.updatedAt } })
+    descriptors.set(descriptor.childSessionId, { ...base, status: descriptor.status === 'starting' ? 'starting' : 'running', ...(descriptor.createdAt ?? descriptor.updatedAt) === undefined ? {} : { updatedAt: descriptor.createdAt ?? descriptor.updatedAt } })
   }
 
   for (const list of events.values()) {
@@ -237,11 +241,11 @@ export function createParentChildLineageStore(file = defaultFile(), initial?: Pa
         childSessionId: descriptor.childSessionId,
         depth: descriptor.depth,
         profile: descriptor.profile,
-        status: 'running',
+        status: descriptor.status === 'starting' ? 'starting' : 'running',
         createdAt: descriptor.createdAt ?? now,
         updatedAt: descriptor.updatedAt ?? now,
       }
-      // A newly created descriptor is always an active delegation run.
+      // Keep the explicit starting state until the child is durably published.
       const withoutUndefined = stored
       descriptors.set(withoutUndefined.childSessionId, withoutUndefined)
       appendEvent({ parentSessionId: withoutUndefined.parentSessionId, nativeTaskId: withoutUndefined.nativeTaskId, childSessionId: withoutUndefined.childSessionId, type: 'create', ...withoutUndefined.createdAt === undefined ? {} : { timestamp: withoutUndefined.createdAt } })
