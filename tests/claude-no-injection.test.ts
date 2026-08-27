@@ -112,7 +112,9 @@ test('Claude final SDK options contain no Harness prompt, tool schema, or custom
     }
 
     query.push(initMessage())
+    await session.whenReady?.()
     const resultPromise = session.run('hello')
+    await new Promise<void>(resolve => setImmediate(resolve))
     query.push({
       type: 'result',
       subtype: 'success',
@@ -190,7 +192,9 @@ test('Claude SDK failures redact credentials from thrown errors and error events
   session.subscribe(event => events.push(event))
 
   try {
+    await session.whenReady?.()
     const resultPromise = session.run('cause a transport failure')
+    await new Promise<void>(resolve => setImmediate(resolve))
     assert.ok(query !== undefined)
     const token = query.options.env?.['ANTHROPIC_AUTH_TOKEN']
     assert.equal(token, secret)

@@ -27,26 +27,6 @@ function initializationResult(): SDKControlInitializeResponse {
   }
 }
 
-function systemInit(sessionId: string): SDKMessage {
-  return {
-    type: 'system',
-    subtype: 'init',
-    session_id: sessionId,
-    apiKeySource: 'none',
-    claude_code_version: 'test',
-    cwd: process.cwd(),
-    tools: [],
-    mcp_servers: [],
-    model: 'claude-sonnet',
-    permissionMode: 'default',
-    slash_commands: [],
-    output_style: '',
-    skills: [],
-    plugins: [],
-    uuid: '00000000-0000-4000-8000-000000000000',
-  } as unknown as SDKMessage
-}
-
 class FakeQuery implements AsyncGenerator<SDKMessage, void> {
   readonly options: ClaudeQueryFactoryInput['options']
   private readonly messages: SDKMessage[] = []
@@ -182,7 +162,7 @@ function registerClaudeSelection(suite: ReturnType<typeof createEngineSuiteRunti
   })
 }
 
-test('Claude readiness requires initializationResult and keeps the native id unset before system/init', async () => {
+test('Claude readiness uses the SDK sessionId option and does not wait for system/init', async () => {
   let resolveInitialization!: (value: SDKControlInitializeResponse) => void
   const initialization = new Promise<SDKControlInitializeResponse>(resolve => { resolveInitialization = resolve })
   const { session, query } = createSessionWithQuery(initialization)
@@ -193,36 +173,32 @@ test('Claude readiness requires initializationResult and keeps the native id uns
   assert.ok(firstReady)
   assert.strictEqual(firstReady, secondReady)
   assert.equal(query.initializationCalls, 1)
-
-  query.push(systemInit('native-session-real'))
-  await tick()
-  assert.equal(session.sessionId, 'native-session-real')
-  assert.equal(query.initializationCalls, 1)
-
-  let settled = false
-  void firstReady.then(() => { settled = true })
-  await tick()
-  assert.equal(settled, false)
+  assert.equal(typeof query.options.sessionId, 'string')
 
   resolveInitialization(initializationResult())
-  await firstReady
-  assert.equal(session.persistenceHandle()?.nativeHandle, 'native-session-real')
+  await Promise.all([firstReady, secondReady])
+  assert.equal(session.sessionId, query.options.sessionId)
+  assert.equal(session.persistenceHandle()?.nativeHandle, query.options.sessionId)
   await session.close()
 })
 
-test('Claude whenReady is idempotent and resolves with the real system/init session id', async () => {
-  const { session, query } = createSessionWithQuery()
-  const firstReady = session.whenReady?.()
-  const secondReady = session.whenReady?.()
-  assert.ok(firstReady)
-  assert.strictEqual(firstReady, secondReady)
-
-  query.push(systemInit('native-session-idempotent'))
-  await Promise.all([firstReady, secondReady])
-  assert.equal(session.sessionId, 'native-session-idempotent')
-  assert.equal(session.persistenceHandle()?.nativeHandle, 'native-session-idempotent')
-  assert.equal(query.initializationCalls, 1)
-  await session.close()
+test('Claude resume readiness uses the native resume id without creating a new SDK sessionId', async () => {
+  let resumedQuery!: FakeQuery
+  const resumed = createClaudeProviderSession({
+    cwd: process.cwd(),
+    resumeSessionId: 'native-session-resume',
+    queryFactory: ({ options }: ClaudeQueryFactoryInput) => {
+      const replacement = new FakeQuery(options)
+      resumedQuery = replacement
+      return replacement as unknown as Query
+    },
+  })
+  await resumed.whenReady?.()
+  assert.equal(resumedQuery.options.sessionId, undefined)
+  assert.equal(resumedQuery.options.resume, 'native-session-resume')
+  assert.equal(resumed.sessionId, 'native-session-resume')
+  assert.equal(resumed.persistenceHandle()?.nativeHandle, 'native-session-resume')
+  await resumed.close()
 })
 
 test('Claude initialization failure closes the transport and rejects whenReady', async () => {

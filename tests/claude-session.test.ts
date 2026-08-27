@@ -52,8 +52,8 @@ function waitFor<T>(predicate: () => T | undefined, timeout = 1_000): Promise<T>
   })
 }
 
-function init(): SDKMessage {
-  return { type: 'system', subtype: 'init', session_id: 'native-session-1', model: 'claude-sonnet', permissionMode: 'default', slash_commands: ['/help'], skills: ['review'], mcp_servers: [], capabilities: ['interrupt_receipt_v1'] } as unknown as SDKMessage
+function init(sessionId: string): SDKMessage {
+  return { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet', permissionMode: 'default', slash_commands: ['/help'], skills: ['review'], mcp_servers: [], capabilities: ['interrupt_receipt_v1'] } as unknown as SDKMessage
 }
 
 test('ClaudeProviderSession maps streaming timeline, reasoning, tools, usage and result', async () => {
@@ -61,22 +61,24 @@ test('ClaudeProviderSession maps streaming timeline, reasoning, tools, usage and
   const session = createClaudeProviderSession({ cwd: process.cwd(), model: 'claude-sonnet', queryFactory: ({ options }) => { query = new FakeQuery(options); return query as unknown as Query } })
   const events: ClaudeAdapterEvent[] = []
   session.subscribe(event => events.push(event))
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
   const resultPromise = session.run('hello')
-  query.push(init())
+  query.push(init(nativeSessionId))
   query.push({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hel' }, index: 0 } } as unknown as SDKMessage)
   query.push({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'plan' }, index: 1 } } as unknown as SDKMessage)
   query.push({ type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } }] } } as unknown as SDKMessage)
   query.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false }] } } as unknown as SDKMessage)
   query.push({ type: 'result', subtype: 'success', is_error: false, result: 'hello', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.01, session_id: 'native-session-1' } as unknown as SDKMessage)
   const result = await resultPromise
-  assert.equal(result.sessionId, 'native-session-1')
+  assert.equal(result.sessionId, nativeSessionId)
   assert.equal(result.finalText, 'hel')
   assert.equal(events.some(event => event.type === 'timeline' && event.item.type === 'reasoning'), true)
   assert.equal(events.some(event => event.type === 'timeline' && event.item.type === 'tool_call'), true)
   assert.equal(events.some(event => event.type === 'timeline' && event.item.type === 'tool_result'), true)
   assert.equal(events.some(event => event.type === 'usage_updated'), true)
   assert.equal(events.some(event => event.type === 'turn_completed'), true)
-  assert.equal(session.persistenceHandle()?.nativeHandle, 'native-session-1')
+  assert.equal(session.persistenceHandle()?.nativeHandle, nativeSessionId)
   await session.refreshCatalog()
   assert.deepEqual(session.listCommands(), [{ name: '/help', description: 'Help', argumentHint: '', source: 'sdk' }])
   await session.close()
@@ -96,10 +98,70 @@ test('ClaudeProviderSession waits for permission response and supports resume', 
   await session.close()
 })
 
+test('ClaudeProviderSession registers SDK permission requests before notifying UI and preserves the full response', async () => {
+  let query!: FakeQuery
+  const session = createClaudeProviderSession({ cwd: process.cwd(), queryFactory: ({ options }) => { query = new FakeQuery(options); return query as unknown as Query } })
+  const events: ClaudeAdapterEvent[] = []
+  session.subscribe(event => {
+    events.push(event)
+    if (event.type !== 'permission_requested') return
+    assert.equal(session.pendingPermissions().length, 1)
+    assert.notEqual(event.request.requestId, event.request.toolUseId)
+    if (event.request.toolName === 'Write') {
+      assert.equal(session.respondToPermission(event.request.requestId, {
+        behavior: 'allow',
+        updatedInput: { file_path: '/tmp/approved.txt', content: 'approved' },
+        updatedPermissions: [{ type: 'addRules', rules: [{ toolName: 'Write', ruleContent: '/tmp/**' }], behavior: 'allow', destination: 'session' }],
+        toolUseID: 'tool-allow-response',
+        decisionClassification: 'user_permanent',
+      }), true)
+    } else {
+      assert.equal(session.respondToPermission(event.request.requestId, {
+        behavior: 'deny',
+        message: 'not approved',
+        interrupt: true,
+        toolUseID: 'tool-deny-response',
+        decisionClassification: 'user_reject',
+      }), true)
+    }
+  })
+
+  const allowed = await query.options.canUseTool!('Write', { file_path: '/tmp/original.txt', content: 'original' }, {
+    requestId: 'sdk-control-allow',
+    toolUseID: 'tool-allow',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(allowed, {
+    behavior: 'allow',
+    updatedInput: { file_path: '/tmp/approved.txt', content: 'approved' },
+    updatedPermissions: [{ type: 'addRules', rules: [{ toolName: 'Write', ruleContent: '/tmp/**' }], behavior: 'allow', destination: 'session' }],
+    toolUseID: 'tool-allow-response',
+    decisionClassification: 'user_permanent',
+  })
+
+  const denied = await query.options.canUseTool!('Bash', { command: 'rm -rf /tmp/nope' }, {
+    requestId: 'sdk-control-deny',
+    toolUseID: 'tool-deny',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(denied, {
+    behavior: 'deny',
+    message: 'not approved',
+    interrupt: true,
+    toolUseID: 'tool-deny-response',
+    decisionClassification: 'user_reject',
+  })
+  assert.equal(session.pendingPermissions().length, 0)
+  assert.equal(events.filter(event => event.type === 'permission_resolved').length, 2)
+  await session.close()
+})
+
 test('ClaudeProviderSession handles failure and cancellation without leaking active turns', async () => {
   let query!: FakeQuery
   const session = createClaudeProviderSession({ cwd: process.cwd(), queryFactory: ({ options }) => { query = new FakeQuery(options); return query as unknown as Query } })
+  await session.whenReady?.()
   const failed = session.run('fail')
+  await new Promise<void>(resolve => setImmediate(resolve))
   query.push({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'upstream failed', session_id: 's' } as unknown as SDKMessage)
   await assert.rejects(failed, /upstream failed/)
   const next = session.startTurn('cancel')
@@ -109,6 +171,34 @@ test('ClaudeProviderSession handles failure and cancellation without leaking act
   await session.close()
 })
 
+
+test('ClaudeProviderSession enables dangerous permission bypass only for bypassPermissions mode', async () => {
+  let defaultQuery: WiringFakeQuery | undefined
+  const defaultSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    permissionMode: 'default',
+    queryFactory: ({ options }) => {
+      defaultQuery = new WiringFakeQuery(options)
+      return defaultQuery as unknown as Query
+    },
+  })
+  assert.ok(defaultQuery !== undefined)
+  assert.equal(Object.hasOwn(defaultQuery.options as Record<string, unknown>, 'allowDangerouslySkipPermissions'), false)
+  await defaultSession.close()
+
+  let bypassQuery: WiringFakeQuery | undefined
+  const bypassSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    permissionMode: 'bypassPermissions',
+    queryFactory: ({ options }) => {
+      bypassQuery = new WiringFakeQuery(options)
+      return bypassQuery as unknown as Query
+    },
+  })
+  assert.ok(bypassQuery !== undefined)
+  assert.equal(bypassQuery.options.allowDangerouslySkipPermissions, true)
+  await bypassSession.close()
+})
 
 test('ClaudeProviderSession composes permission, dialog, catalog, MCP and Skill adapters', async () => {
   let query: WiringFakeQuery | undefined
@@ -148,6 +238,7 @@ test('ClaudeProviderSession composes permission, dialog, catalog, MCP and Skill 
   session.subscribe(event => events.push(event))
 
   const sdkOptions = query.options as Record<string, unknown>
+  assert.equal(Object.hasOwn(sdkOptions, 'allowDangerouslySkipPermissions'), false, 'default permission mode must not launch with bypass enabled')
   assert.deepEqual(sdkOptions['mcpServers'], {
     'workspace-tools': {
       type: 'stdio',
@@ -162,7 +253,9 @@ test('ClaudeProviderSession composes permission, dialog, catalog, MCP and Skill 
     assert.equal(Object.hasOwn(sdkOptions, forbidden), false, `forbidden SDK option leaked: ${forbidden}`)
   }
 
-  query.push(init())
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
+  query.push(init(nativeSessionId))
   await session.whenReady?.()
 
   const catalog = await session.refreshCatalog()
@@ -236,7 +329,9 @@ test('ClaudeProviderSession forwards slash input, applies next-turn settings, em
   assert.ok(query !== undefined)
   assert.ok(promptIterator !== undefined)
   session.subscribe(event => events.push(event))
-  query.push(init())
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
+  query.push(init(nativeSessionId))
   await session.whenReady?.()
 
   const rawSlash = '/help "two words"  '
@@ -273,7 +368,7 @@ test('ClaudeProviderSession forwards slash input, applies next-turn settings, em
   await waitFor(() => events.filter(candidate => candidate.type === 'turn_completed').length >= 2 ? true : undefined)
 
   const rewind = await session.rewind({ mode: 'both', messageId: 'message-1' })
-  assert.deepEqual(rewindCalls, ['fork:native-session-1:message-1'])
+  assert.deepEqual(rewindCalls, [`fork:${nativeSessionId}:message-1`])
   assert.equal(rewind.files?.canRewind, true)
   assert.equal(rewind.sessionId, 'forked-session')
   assert.equal(session.persistenceHandle()?.nativeHandle, 'forked-session')

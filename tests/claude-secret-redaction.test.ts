@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { Query, SDKMessage, SDKSystemMessage } from '@anthropic-ai/claude-agent-sdk'
+import type { Query, SDKControlInitializeResponse, SDKMessage, SDKSystemMessage } from '@anthropic-ai/claude-agent-sdk'
 import { createClaudeProviderSession, type ClaudeQueryFactoryInput } from '../src/claude/adapter.js'
 import { ClaudeCredentialRedactor, ClaudeSdkTransport } from '../src/claude/transport.js'
 import type { ClaudeAdapterEvent } from '../src/claude/types.js'
@@ -62,7 +62,7 @@ class FakeQuery implements AsyncGenerator<SDKMessage, void> {
   async setModel(): Promise<never> { throw new Error('unused') }
   async setMaxThinkingTokens(): Promise<never> { throw new Error('unused') }
   async applyFlagSettings(): Promise<never> { throw new Error('unused') }
-  async initializationResult(): Promise<never> { throw new Error('unused') }
+  async initializationResult(): Promise<SDKControlInitializeResponse> { return { commands: [], agents: [], output_style: '', available_output_styles: [], models: [], account: {} } }
   async reinitialize(): Promise<never> { throw new Error('unused') }
   async supportedCommands(): Promise<never> { throw new Error('unused') }
   async supportedModels(): Promise<never> { throw new Error('unused') }
@@ -212,7 +212,9 @@ test('Claude session redacts initialization, turn_failed, and process_exited fai
   })
   session.subscribe(event => events.push(event))
   try {
+    await session.whenReady()
     const result = session.run('hello')
+    await new Promise<void>(resolve => setImmediate(resolve))
     assert.ok(query)
     query.fail(new Error(`process exited ${turnSecret}`))
     await assert.rejects(result, error => error instanceof Error && !error.message.includes(turnSecret))

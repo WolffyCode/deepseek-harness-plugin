@@ -104,8 +104,9 @@ function createSession(config, cwd, configDir, resumeSessionId, queryState) {
 async function runTurn(session, prompt) {
   const events = []
   let firstToken = false
-  let permissionRequested = false
-  let permissionResolved = false
+  const permissionRequestIds = new Set()
+  const permissionApiResponseIds = new Set()
+  const permissionResolvedIds = new Set()
   let toolCall = false
   let toolResult = false
   const off = session.subscribe(event => {
@@ -113,19 +114,32 @@ async function runTurn(session, prompt) {
     if (event.type === 'timeline' && event.item.type === 'assistant_message' && event.item.partial === true && event.item.text.length > 0) firstToken = true
     if (event.type === 'timeline' && event.item.type === 'tool_call') toolCall = true
     if (event.type === 'timeline' && event.item.type === 'tool_result') toolResult = true
-    if (event.type === 'permission_requested' && !permissionRequested) {
-      permissionRequested = true
-      const accepted = session.respondToPermission(event.request.requestId, {
+    if (event.type === 'permission_requested') {
+      const requestId = event.request.requestId
+      if (permissionRequestIds.has(requestId)) return
+      permissionRequestIds.add(requestId)
+      if (session.respondToPermission(requestId, {
         behavior: 'allow',
         updatedInput: event.request.input,
         ...(event.request.toolUseId ? { toolUseID: event.request.toolUseId } : {}),
-      })
-      permissionResolved = accepted
+      })) permissionApiResponseIds.add(requestId)
     }
+    if (event.type === 'permission_resolved') permissionResolvedIds.add(event.requestId)
   })
   try {
     const result = await withTimeout(session.run(prompt), TIMEOUT_MS, 'Claude real turn')
-    return { result, events, firstToken, permissionRequested, permissionResolved, toolCall, toolResult }
+    const permissionRequested = permissionRequestIds.size > 0
+    const permissionResolved = permissionRequestIds.size > 0 && [...permissionRequestIds].every(requestId => permissionApiResponseIds.has(requestId) && permissionResolvedIds.has(requestId))
+    return {
+      result,
+      events,
+      firstToken,
+      permissionRequested,
+      permissionResolved,
+      permissionStatus: permissionResolved ? 'requested-and-allowed' : 'requested-unresolved',
+      toolCall,
+      toolResult,
+    }
   } finally {
     off()
   }
@@ -164,11 +178,16 @@ if (precondition.kind === 'skipped') {
     await withTimeout(session.whenReady(), INITIALIZATION_TIMEOUT_MS, 'Claude initialization')
     const nativeSessionId = session.sessionId
     if (!nativeSessionId) throw new Error('Claude initialization did not expose a native session id')
-    const turn = await runTurn(session, 'Use the Bash tool to run exactly: printf REAL_TOOL_OK. Then reply with exactly: REAL_CLAUDE_OK')
+    const permissionTarget = join(root, 'permission-target.txt')
+    const turn = await runTurn(session, `Do not use Bash. Use the Write tool to write exactly REAL_PERMISSION_OK to this absolute path: ${permissionTarget}. Then reply with exactly: REAL_CLAUDE_OK`)
     if (!turn.firstToken) throw new Error('Claude real stream did not emit a partial assistant token')
-    if (!turn.permissionRequested || !turn.permissionResolved) throw new Error('Claude real permission request was not observed and approved')
-    if (!turn.toolCall || !turn.toolResult) throw new Error('Claude real Bash tool call/result was not observed')
+    if (!turn.permissionRequested) throw new Error('Claude real Write turn did not cross the permission callback')
+    if (!turn.permissionResolved) throw new Error('Claude real permission requests were not all resolved through the session API')
+    if (turn.permissionStatus !== 'requested-and-allowed') throw new Error(`Claude real permission status was ${turn.permissionStatus}`)
+    if (session.pendingPermissions().length !== 0) throw new Error('Claude real permission registry still has pending requests after the turn')
+    if (!turn.toolCall || !turn.toolResult) throw new Error('Claude real Write tool call/result was not observed')
     if (!turn.result.finalText.includes('REAL_CLAUDE_OK')) throw new Error('Claude real response missed the smoke marker')
+    if (await readFile(permissionTarget, 'utf8') !== 'REAL_PERMISSION_OK') throw new Error('Claude real Write tool did not write the expected safe marker')
     await session.close()
     await session.close()
     session = createSession(config, cwd, configDir, nativeSessionId, queryState)
@@ -187,7 +206,11 @@ if (precondition.kind === 'skipped') {
       nativeSessionId,
       stream: true,
       tool: true,
-      permission: true,
+      permission: {
+        status: turn.permissionStatus,
+        requested: turn.permissionRequested,
+        resolved: turn.permissionResolved,
+      },
       resume: true,
       close: true,
       secretOnDisk: false,

@@ -279,7 +279,7 @@ export interface ClaudeAgentSession {
   history?(options?: Pick<GetSessionMessagesOptions, 'limit' | 'offset' | 'includeSystemMessages' | 'sessionStore'>): Promise<readonly SessionMessage[]>
   /** Creates a new ProviderSession and resumes this native conversation after reconnect. */
   reconnect?(): Promise<ClaudeAgentSession>
-  /** Resolves only after the SDK has returned initialization and a real system/init session id was observed. */
+  /** Resolves after SDK initialization succeeds and the CLI-adopted native session id is known. */
   whenReady?: () => Promise<void>
 }
 

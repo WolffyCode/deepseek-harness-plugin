@@ -29,6 +29,7 @@ export declare class ClaudeProviderSession implements ClaudeAgentSession {
     private stderrTail;
     private turnSequence;
     private closed;
+    private readonly nativeSessionId;
     private _sessionId;
     private _forked;
     private readyPromise;
@@ -37,8 +38,7 @@ export declare class ClaudeProviderSession implements ClaudeAgentSession {
     private readySettled;
     private readyError;
     private turnStarting;
-    private initializationMessageReceived;
-    private readonly initializationWaiters;
+    private sessionStartedEmitted;
     private _catalog;
     constructor(options: ClaudeAdapterOptions);
     get sessionId(): string | undefined;
@@ -72,9 +72,6 @@ export declare class ClaudeProviderSession implements ClaudeAgentSession {
     refreshCatalog(): Promise<ClaudeCatalog>;
     rewind(input: ClaudeRewindRequest): Promise<ClaudeRewindResult>;
     private initializeReadiness;
-    private waitForInitializationMessage;
-    private resolveInitializationWaiters;
-    private rejectInitializationWaiters;
     private resolveReady;
     private rejectReady;
     private failInitialization;
@@ -94,6 +91,7 @@ export declare class ClaudeProviderSession implements ClaudeAgentSession {
     private handleMessage;
     private handleSubagentMessage;
     private handleSystem;
+    private emitSessionStarted;
     private applyInitialization;
     private handleStreamEvent;
     private handleAssistant;

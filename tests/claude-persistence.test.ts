@@ -124,6 +124,8 @@ test("archive state is keyed by a validated native handle and stays separate fro
 });
 
 class PersistenceFakeQuery implements AsyncGenerator<SDKMessage, void> {
+  readonly options: import('@anthropic-ai/claude-agent-sdk').Options
+  constructor(options: import('@anthropic-ai/claude-agent-sdk').Options) { this.options = options }
   private done = false;
   private readonly waiters: Array<(result: IteratorResult<SDKMessage>) => void> = [];
   async next(): Promise<IteratorResult<SDKMessage>> {
@@ -138,7 +140,7 @@ class PersistenceFakeQuery implements AsyncGenerator<SDKMessage, void> {
   async throw(error?: unknown): Promise<IteratorResult<SDKMessage>> { this.done = true; throw error; }
   [Symbol.asyncIterator](): AsyncGenerator<SDKMessage, void> { return this; }
   async interrupt(): Promise<void> { await this.return(); }
-  async initializationResult(): Promise<Record<string, unknown>> { return {}; }
+  async initializationResult(): Promise<Record<string, unknown>> { await new Promise<void>(resolve => setImmediate(resolve)); return {}; }
   async supportedCommands(): Promise<unknown[]> { return []; }
   async supportedModels(): Promise<unknown[]> { return []; }
   push(message: SDKMessage): void {
@@ -152,20 +154,23 @@ test("ProviderSession exposes history and reconnects from its validated native h
   const session = createClaudeProviderSession({
     cwd: "/workspace/project",
     model: "glm-5.3-max",
-    queryFactory: ({}) => {
-      const query = new PersistenceFakeQuery();
+    queryFactory: ({ options }) => {
+      const query = new PersistenceFakeQuery(options);
       queries.push(query);
-      queueMicrotask(() => query.push({ type: "system", subtype: "init", session_id: queries.length === 1 ? "native-1" : "native-2", model: "glm-5.3-max" } as unknown as SDKMessage));
       return query as unknown as Query;
     },
   });
   await session.whenReady?.();
-  assert.deepEqual(session.persistenceHandle(), { provider: "claude-cli", sessionId: "native-1", nativeHandle: "native-1", cwd: "/workspace/project" });
+  const nativeSessionId = queries[0]?.options.sessionId;
+  assert.equal(typeof nativeSessionId, "string");
+  assert.deepEqual(session.persistenceHandle(), { provider: "claude-cli", sessionId: nativeSessionId, nativeHandle: nativeSessionId, cwd: "/workspace/project" });
   const history = await session.history?.();
   assert.deepEqual(history, []);
   const reconnected = await session.reconnect?.();
   assert.ok(reconnected !== undefined);
   await reconnected?.whenReady?.();
-  assert.equal(reconnected?.sessionId, "native-2");
+  assert.equal(queries[1]?.options.sessionId, undefined);
+  assert.equal(queries[1]?.options.resume, nativeSessionId);
+  assert.equal(reconnected?.sessionId, nativeSessionId);
   await reconnected?.close();
 });

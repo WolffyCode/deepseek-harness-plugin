@@ -26,6 +26,7 @@ type TurnObservation = {
   readonly firstToken: boolean
   readonly permissionRequested: boolean
   readonly permissionResolved: boolean
+  readonly permissionStatus: 'requested-and-allowed' | 'requested-unresolved'
   readonly toolCall: boolean
   readonly toolResult: boolean
 }
@@ -113,26 +114,40 @@ function createSession(config: RealConfig, cwd: string, configDir: string, query
 
 async function runTurn(session: ClaudeAgentSession, prompt: string): Promise<TurnObservation> {
   let firstToken = false
-  let permissionRequested = false
-  let permissionResolved = false
+  const permissionRequestIds = new Set<string>()
+  const permissionApiResponseIds = new Set<string>()
+  const permissionResolvedIds = new Set<string>()
   let toolCall = false
   let toolResult = false
   const off = session.subscribe((event: ClaudeAdapterEvent) => {
     if (event.type === 'timeline' && event.item.type === 'assistant_message' && event.item.partial === true && typeof event.item.text === 'string' && event.item.text.length > 0) firstToken = true
     if (event.type === 'timeline' && event.item.type === 'tool_call') toolCall = true
     if (event.type === 'timeline' && event.item.type === 'tool_result') toolResult = true
-    if (event.type === 'permission_requested' && !permissionRequested) {
-      permissionRequested = true
-      permissionResolved = session.respondToPermission(event.request.requestId, {
+    if (event.type === 'permission_requested') {
+      const requestId = event.request.requestId
+      if (permissionRequestIds.has(requestId)) return
+      permissionRequestIds.add(requestId)
+      if (session.respondToPermission(requestId, {
         behavior: 'allow',
         updatedInput: event.request.input,
         ...(event.request.toolUseId === undefined ? {} : { toolUseID: event.request.toolUseId }),
-      })
+      })) permissionApiResponseIds.add(requestId)
     }
+    if (event.type === 'permission_resolved') permissionResolvedIds.add(event.requestId)
   })
   try {
     const result = await withTimeout(session.run(prompt), 'Claude real turn')
-    return { result, firstToken, permissionRequested, permissionResolved, toolCall, toolResult }
+    const permissionRequested = permissionRequestIds.size > 0
+    const permissionResolved = permissionRequestIds.size > 0 && [...permissionRequestIds].every(requestId => permissionApiResponseIds.has(requestId) && permissionResolvedIds.has(requestId))
+    return {
+      result,
+      firstToken,
+      permissionRequested,
+      permissionResolved,
+      permissionStatus: permissionResolved ? 'requested-and-allowed' : 'requested-unresolved',
+      toolCall,
+      toolResult,
+    }
   } finally {
     off()
   }
@@ -166,15 +181,19 @@ const realTest = test('Claude real CLI + SDK query E2E (opt-in)', { skip: prefli
     session = createSession(config, cwd, configDir, queryCount)
     await withTimeout(session.whenReady?.() ?? Promise.reject(new Error('Claude session has no readiness gate')), 'Claude initialization', INITIALIZATION_TIMEOUT_MS)
     const nativeSessionId = session.sessionId
-    assert.ok(nativeSessionId, 'real Claude system/init did not provide a native session id')
+    assert.ok(nativeSessionId, 'real Claude SDK sessionId option was not exposed after initialization')
     assert.equal(queryCount.value, 1, 'the E2E must create an SDK query')
-    const first = await runTurn(session, 'Use the Bash tool to run exactly: printf REAL_TOOL_OK. Then reply with exactly: REAL_CLAUDE_OK')
+    const permissionTarget = join(root, 'permission-target.txt')
+    const first = await runTurn(session, `Do not use Bash. Use the Write tool to write exactly REAL_PERMISSION_OK to this absolute path: ${permissionTarget}. Then reply with exactly: REAL_CLAUDE_OK`)
     assert.equal(first.firstToken, true, 'the first assistant token must arrive through the partial stream')
-    assert.equal(first.permissionRequested, true, 'the real Bash turn must cross the permission callback')
-    assert.equal(first.permissionResolved, true, 'the real permission request must be approved through the session API')
-    assert.equal(first.toolCall, true, 'the real Bash tool call must be observable')
-    assert.equal(first.toolResult, true, 'the real Bash tool result must be observable')
+    assert.equal(first.permissionRequested, true, 'the real Write turn must cross the permission callback')
+    assert.equal(first.permissionResolved, true, 'every real permission request must be resolved through the session API')
+    assert.equal(first.permissionStatus, 'requested-and-allowed')
+    assert.equal(session.pendingPermissions().length, 0, 'real permission registry must have no pending requests after the turn')
+    assert.equal(first.toolCall, true, 'the real Write tool call must be observable')
+    assert.equal(first.toolResult, true, 'the real Write tool result must be observable')
     assert.match(first.result.finalText, /REAL_CLAUDE_OK/)
+    assert.equal(await readFile(permissionTarget, 'utf8'), 'REAL_PERMISSION_OK')
     await session.close()
     await session.close()
     session = createSession(config, cwd, configDir, queryCount, nativeSessionId)

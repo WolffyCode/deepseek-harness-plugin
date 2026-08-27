@@ -114,11 +114,6 @@ interface PendingQuestion {
   readonly abortListener: (() => void) | undefined
 }
 
-interface InitializationWaiter {
-  readonly resolve: () => void
-  readonly reject: (error: Error) => void
-}
-
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
@@ -304,6 +299,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   private stderrTail = ''
   private turnSequence = 0
   private closed = false
+  private readonly nativeSessionId: string
   private _sessionId: string | undefined
   private _forked = false
   private readyPromise: Promise<void> | undefined
@@ -312,14 +308,18 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   private readySettled = false
   private readyError: Error | undefined
   private turnStarting = false
-  private initializationMessageReceived = false
-  private readonly initializationWaiters = new Set<InitializationWaiter>()
+  private sessionStartedEmitted = false
   private _catalog: ClaudeCatalog = {
     models: [], commands: [], modes: [], skills: [], mcpServers: [], capabilities: [],
   }
 
   constructor(options: ClaudeAdapterOptions) {
     this.options = options
+    if (options.resumeSessionId !== undefined && options.sessionId !== undefined && options.forkSession !== true) {
+      throw new Error('Claude sessionId cannot be combined with resumeSessionId unless forkSession is enabled')
+    }
+    this.nativeSessionId = options.sessionId
+      ?? (options.resumeSessionId === undefined || options.forkSession === true ? randomUUID() : options.resumeSessionId)
     this.redactor = ClaudeCredentialRedactor.fromAdapterOptions(options)
     this.permissionRegistry = new PermissionRegistry({ ...(options.permissionTimeoutMs === undefined ? {} : { defaultTimeoutMs: options.permissionTimeoutMs }) })
     this.modelState = new NextTurnStateMachine<string | undefined>(options.model)
@@ -570,33 +570,15 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
         this.applyInitializationResult(result)
       }
       if (this.closed) return
-      if (!this.initializationMessageReceived) await this.waitForInitializationMessage()
-      if (this.closed) return
-      if (this._sessionId === undefined) throw new Error('Claude initialization did not provide a session id')
+      if (this._sessionId === undefined) {
+        this._sessionId = this.nativeSessionId
+        this.emitSessionStarted()
+      }
       this.resolveReady()
     } catch (error) {
       if (this.closed && this.readySettled) return
       await this.failInitialization(this.redactor.redactError(error))
     }
-  }
-
-  private waitForInitializationMessage(): Promise<void> {
-    if (this.initializationMessageReceived) return Promise.resolve()
-    return new Promise<void>((resolve, reject) => {
-      this.initializationWaiters.add({ resolve, reject })
-    })
-  }
-
-  private resolveInitializationWaiters(): void {
-    const waiters = [...this.initializationWaiters]
-    this.initializationWaiters.clear()
-    for (const waiter of waiters) waiter.resolve()
-  }
-
-  private rejectInitializationWaiters(error: Error): void {
-    const waiters = [...this.initializationWaiters]
-    this.initializationWaiters.clear()
-    for (const waiter of waiters) waiter.reject(error)
   }
 
   private resolveReady(): void {
@@ -619,7 +601,6 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   private async failInitialization(error: unknown): Promise<void> {
     const redacted = this.redactor.redactError(error)
     this.rejectReady(redacted)
-    this.rejectInitializationWaiters(redacted)
     await this.closeTransport(redacted)
   }
 
@@ -629,11 +610,9 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     this.unsubscribeTransport()
     if (reason !== undefined) {
       this.rejectReady(reason)
-      this.rejectInitializationWaiters(reason)
-    } else if (!this.initializationMessageReceived && this.readyPromise !== undefined && !this.readySettled) {
+    } else if (this.readyPromise !== undefined && !this.readySettled) {
       const closeError = new Error('Claude session closed before initialization')
       this.rejectReady(closeError)
-      this.rejectInitializationWaiters(closeError)
     }
     const turn = this.activeTurn
     if (turn !== undefined) {
@@ -671,13 +650,15 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     this.turnStarting = true
     const turnId = `claude-turn-${++this.turnSequence}`
     try {
+      await this.whenReady()
+      if (this.closed) throw new Error('Claude session is closed')
       await this.applyPendingTurnSettings()
       this.activeTurn = { id: turnId, finalText: '', ...completion }
       this.toolInputByIndex.clear()
       this.toolMetaByIndex.clear()
       this.emit({ type: 'turn_started', turnId, ...(this._sessionId === undefined ? {} : { sessionId: this._sessionId }) })
       const content = slash?.ok === true ? slash.forwardRaw : prompt
-      this.transport.send(this.inputMessage(content, false, options.clientMessageId === undefined ? undefined : randomUUID()))
+      this.transport.send(this.inputMessage(content, true, options.clientMessageId === undefined ? undefined : randomUUID()))
       return { turnId }
     } catch (error) {
       const redacted = this.redactor.redactError(error)
@@ -798,7 +779,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       includePartialMessages: true,
       forwardSubagentText: true,
       enableFileCheckpointing: true,
-      allowDangerouslySkipPermissions: true,
+      ...(this.options.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
       settingSources: [],
       canUseTool,
       onUserDialog,
@@ -818,7 +799,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       ...(mcpServers === undefined ? {} : { mcpServers: { ...mcpServers } }),
       ...(plugins === undefined ? {} : { plugins: [...plugins] }),
       ...(this.userAgentDefinitions === undefined ? {} : { agents: { ...this.userAgentDefinitions } }),
-      ...(this.options.sessionId === undefined ? {} : { sessionId: this.options.sessionId }),
+      ...(this.options.resumeSessionId !== undefined && this.options.forkSession !== true ? {} : { sessionId: this.nativeSessionId }),
       ...(this.options.resumeSessionId === undefined ? {} : { resume: this.options.resumeSessionId }),
       ...(this.options.forkSession === undefined ? {} : { forkSession: this.options.forkSession }),
     }
@@ -826,13 +807,12 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
 
   private async requestPermission(toolName: string, input: Record<string, unknown>, options: Parameters<CanUseTool>[2]): Promise<PermissionResult> {
     const permissionMode = this.modeState.current ?? 'default'
-    const requestOptions = options.requestId.length > 0 ? options : { ...options, requestId: randomUUID() }
     const controlRequest = toolName === 'AskUserQuestion'
-      ? toAskUserQuestion(toolName, input, requestOptions, permissionMode)
-      : toPermissionRequest(toolName, input, requestOptions, permissionMode)
+      ? toAskUserQuestion(toolName, input, options, permissionMode)
+      : toPermissionRequest(toolName, input, options, permissionMode)
     const request = claudePermissionRequest(controlRequest, options.signal)
-    this.emit({ type: 'permission_requested', request })
     if (this.options.permissionHandler) {
+      this.emit({ type: 'permission_requested', request })
       try {
         const decision = permissionDecisionForSdk(await this.options.permissionHandler(request))
         this.emit({ type: 'permission_resolved', requestId: request.requestId, decision: claudePermissionDecision(decision) })
@@ -842,17 +822,18 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       }
     }
     if (this.options.defaultPermission !== undefined) {
+      this.emit({ type: 'permission_requested', request })
       const decision = this.options.defaultPermission
       this.emit({ type: 'permission_resolved', requestId: request.requestId, decision: claudePermissionDecision(decision) })
       return decision
     }
+    const responsePromise = this.permissionRegistry.begin(controlRequest, {
+      signal: options.signal,
+    })
+    this.emit({ type: 'permission_requested', request })
     try {
-      const response = await this.permissionRegistry.begin(controlRequest, {
-        signal: options.signal,
-      })
-      const decision = toSdkPermissionResult(response)
-      this.emit({ type: 'permission_resolved', requestId: request.requestId, decision: claudePermissionDecision(decision) })
-      return decision
+      const response = await responsePromise
+      return toSdkPermissionResult(response)
     } catch (error) {
       if (error instanceof ControlError && (error.code === 'timeout' || error.code === 'canceled')) {
         const decision: ClaudePermissionDecision = { behavior: 'deny', message: error.message, interrupt: error.code === 'canceled', ...(request.toolUseId === undefined ? {} : { toolUseID: request.toolUseId }) }
@@ -982,21 +963,17 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       return
     }
     if (subtype === 'init') {
-      const sessionId = stringValue(message['session_id'])
-      if (sessionId === undefined) {
-        if (this.readyPromise !== undefined && !this.readySettled) {
-          void this.failInitialization(new Error('Claude initialization did not provide a session id'))
-        }
-        return
-      }
-      this._sessionId = sessionId
-      this.initializationMessageReceived = true
       this.applyInitialization(message)
-      this.resolveInitializationWaiters()
-      this.emit({ type: 'session_started', sessionId, catalog: this._catalog })
+      this.emitSessionStarted()
     } else if (subtype === 'compact_boundary') {
       this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'compaction', text: this.redactor.redact(stringValue(message['compact_metadata']) ?? ''), metadata: this.redactor.redactValue(message) } })
     } else this.emit({ type: 'status_changed', status: subtype ?? 'system', metadata: this.redactor.redactValue(message) })
+  }
+
+  private emitSessionStarted(): void {
+    if (this.sessionStartedEmitted || this._sessionId === undefined) return
+    this.sessionStartedEmitted = true
+    this.emit({ type: 'session_started', sessionId: this._sessionId, catalog: this._catalog })
   }
 
   private applyInitialization(message: Record<string, unknown>): void {
@@ -1092,11 +1069,11 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   }
 
   private handleResult(message: Record<string, unknown>): void {
+    const isError = boolValue(message['is_error']) === true || stringValue(message['subtype'])?.startsWith('error')
     const turn = this.activeTurn
     if (turn === undefined) return
     const usage = usageOf(message['usage'], message)
     if (usage) this.emit({ type: 'usage_updated', turnId: turn.id, usage })
-    const isError = boolValue(message['is_error']) === true || stringValue(message['subtype'])?.startsWith('error')
     if (isError) {
       const messageText = stringValue(message['result']) ?? (message['errors'] === undefined ? undefined : serialize(message['errors'])) ?? 'Claude turn failed'
       const diagnostic = this.stderrTail.trim()
