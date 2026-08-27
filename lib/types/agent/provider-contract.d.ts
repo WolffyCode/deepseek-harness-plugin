@@ -18,6 +18,64 @@ export interface ProviderCapabilities {
 }
 export type AgentProvider = string;
 export type AgentMetadata = Readonly<Record<string, unknown>>;
+export type AgentToolKind = "command" | "file" | "mcp" | "dynamic" | "web" | "computer" | "other";
+export interface AgentToolMetadata {
+    readonly kind: AgentToolKind;
+    readonly name?: string;
+    readonly command?: string;
+    readonly cwd?: string;
+    readonly outputDelta?: string;
+}
+export interface AgentFileMetadata {
+    readonly paths?: readonly string[];
+    readonly changes?: unknown;
+    readonly patch?: unknown;
+    readonly outputDelta?: string;
+}
+export interface AgentMcpMetadata {
+    readonly server?: string;
+    readonly tool?: string;
+    readonly progress?: unknown;
+}
+export interface AgentReasoningMetadata {
+    readonly stream?: "text" | "summary";
+    readonly contentIndex?: number;
+    readonly summaryIndex?: number;
+}
+export interface AgentUsageCounter {
+    readonly inputTokens?: number;
+    readonly cachedInputTokens?: number;
+    readonly outputTokens?: number;
+    readonly reasoningTokens?: number;
+    readonly totalTokens?: number;
+}
+/** Provider-neutral usage counters. `turn` is the most recent turn/segment. */
+export interface AgentUsageBreakdown {
+    readonly total?: AgentUsageCounter;
+    readonly turn?: AgentUsageCounter;
+}
+export interface AgentStructuredError {
+    readonly message: string;
+    readonly code?: string;
+    readonly diagnostic?: string;
+    readonly details?: AgentMetadata;
+}
+export type AgentServerRequestKind = "command_approval" | "file_approval" | "permission" | "user_input" | "elicitation";
+export interface AgentServerRequest {
+    readonly id?: string | number;
+    readonly kind: AgentServerRequestKind;
+    readonly toolName?: string;
+    readonly input?: AgentMetadata;
+}
+/** Stable metadata shared by external engines; provider protocol names do not belong here. */
+export interface AgentEventMetadata extends AgentMetadata {
+    readonly tool?: AgentToolMetadata;
+    readonly file?: AgentFileMetadata;
+    readonly mcp?: AgentMcpMetadata;
+    readonly reasoning?: AgentReasoningMetadata;
+    readonly error?: AgentStructuredError;
+    readonly serverRequest?: AgentServerRequest;
+}
 export interface AgentPersistenceHandle {
     readonly provider: AgentProvider;
     readonly sessionId: string;
@@ -47,6 +105,7 @@ export interface AgentUsage {
     readonly totalCostUsd?: number;
     readonly contextWindowMaxTokens?: number;
     readonly contextWindowUsedTokens?: number;
+    readonly breakdown?: AgentUsageBreakdown;
 }
 export interface AgentRuntimeInfo {
     readonly provider: AgentProvider;
@@ -130,15 +189,18 @@ export type AgentTimelineItem = {
     readonly text: string;
     readonly messageId?: string;
     readonly clientMessageId?: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "assistant_message";
     readonly text: string;
     readonly messageId?: string;
     /** True when text is an incremental provider chunk rather than a replayed final message. */
     readonly partial?: boolean;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "reasoning";
     readonly text: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "tool_call";
     readonly id: string;
@@ -147,16 +209,20 @@ export type AgentTimelineItem = {
     readonly input?: unknown;
     readonly output?: unknown;
     readonly error?: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "todo";
     readonly items: readonly AgentTodoItem[];
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "compaction";
     readonly status: "loading" | "completed";
     readonly trigger?: "auto" | "manual";
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "error";
     readonly message: string;
+    readonly metadata?: AgentEventMetadata;
 };
 export interface AgentTodoItem {
     readonly id: string;
@@ -195,15 +261,18 @@ export type AgentStreamEvent = {
     readonly type: "thread_started";
     readonly provider: AgentProvider;
     readonly sessionId: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "turn_started";
     readonly provider: AgentProvider;
     readonly turnId?: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "turn_completed";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly usage?: AgentUsage;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "turn_failed";
     readonly provider: AgentProvider;
@@ -211,67 +280,86 @@ export type AgentStreamEvent = {
     readonly error: string;
     readonly code?: string;
     readonly diagnostic?: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "turn_canceled";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly reason: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "timeline";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly item: AgentTimelineItem;
     readonly timestamp?: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "reasoning";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly text: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "usage_updated";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly usage: AgentUsage;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "permission_requested";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly request: AgentPermissionRequest;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "permission_resolved";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly requestId: string;
     readonly resolution: AgentPermissionResponse;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "mode_changed";
     readonly provider: AgentProvider;
     readonly currentModeId: string | null;
     readonly availableModes: readonly AgentMode[];
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "model_changed";
     readonly provider: AgentProvider;
     readonly runtimeInfo: AgentRuntimeInfo;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "thinking_option_changed";
     readonly provider: AgentProvider;
     readonly thinkingOptionId: string | null;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "attention_required";
     readonly provider: AgentProvider;
     readonly reason: "finished" | "error" | "permission";
     readonly timestamp: string;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "provider_subagent";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly event: ProviderSubagentEvent;
+    readonly metadata?: AgentEventMetadata;
+} | {
+    readonly type: "server_request";
+    readonly provider: AgentProvider;
+    readonly turnId?: string;
+    readonly request: AgentServerRequest;
+    readonly metadata?: AgentEventMetadata;
 } | {
     readonly type: "error";
     readonly provider: AgentProvider;
     readonly turnId?: string;
     readonly error: string;
     readonly code?: string;
+    readonly metadata?: AgentEventMetadata;
 };
 export declare function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined;
 //# sourceMappingURL=provider-contract.d.ts.map

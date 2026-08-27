@@ -7,6 +7,7 @@ export interface EngineSuiteChildBridgeRequest {
 export interface EngineSuiteChildBridgeResult {
     readonly childSessionId: string;
     readonly text: string;
+    readonly nativeTaskId?: string;
 }
 export type EngineSuiteChildBridgeHandler = (request: EngineSuiteChildBridgeRequest) => Promise<EngineSuiteChildBridgeResult>;
 export interface EngineSuiteChildBridgeLaunch {
@@ -26,12 +27,14 @@ export declare class EngineSuiteChildBridge {
     private readonly handler;
     private readonly token;
     private readonly server;
+    private readonly parents;
     private address;
     private started;
     constructor(handler: EngineSuiteChildBridgeHandler);
     start(): Promise<void>;
     close(): Promise<void>;
     launchFor(parentSessionId: string): EngineSuiteChildBridgeLaunch;
+    release(parentSessionId: string): void;
     private handle;
 }
 //# sourceMappingURL=bridge.d.ts.map

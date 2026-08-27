@@ -3,7 +3,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 export type ParentChildLineageStatus = 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached'
-export type ParentChildLineageEventType = 'progress' | 'result' | 'error' | 'cancel'
+export type ParentChildLineageEventType = 'create' | 'start' | 'progress' | 'result' | 'failure' | 'cancel' | 'archive' | 'detach' | 'resume'
+export type ParentChildLineageTerminalStatus = 'completed' | 'failed' | 'canceled' | 'archived'
 
 export interface ParentChildLineageDescriptor {
   readonly parentSessionId: string
@@ -12,6 +13,8 @@ export interface ParentChildLineageDescriptor {
   readonly depth: number
   readonly profile: string
   readonly status: ParentChildLineageStatus
+  /** Execution terminal for the current delegation run; detached is a relationship state. */
+  readonly terminalStatus?: ParentChildLineageTerminalStatus
   readonly createdAt?: string
   readonly updatedAt?: string
 }
@@ -56,9 +59,15 @@ function text(value: string, name: string): string {
   return normalized
 }
 
+function executionTerminal(status: ParentChildLineageStatus): ParentChildLineageTerminalStatus | undefined {
+  return status === 'completed' || status === 'failed' || status === 'canceled' || status === 'archived' ? status : undefined
+}
+
 function validateDescriptor(input: ParentChildLineageDescriptor): ParentChildLineageDescriptor {
   if (!Number.isSafeInteger(input.depth) || input.depth < 1) throw new RangeError('lineage depth must be a positive safe integer')
   if (input.status !== 'running' && input.status !== 'completed' && input.status !== 'failed' && input.status !== 'canceled' && input.status !== 'archived' && input.status !== 'detached') throw new TypeError('invalid lineage status')
+  const terminalStatus = input.terminalStatus ?? executionTerminal(input.status)
+  if (terminalStatus !== undefined && terminalStatus !== 'completed' && terminalStatus !== 'failed' && terminalStatus !== 'canceled' && terminalStatus !== 'archived') throw new TypeError('invalid lineage terminal status')
   return {
     parentSessionId: text(input.parentSessionId, 'parentSessionId'),
     nativeTaskId: text(input.nativeTaskId, 'nativeTaskId'),
@@ -66,6 +75,7 @@ function validateDescriptor(input: ParentChildLineageDescriptor): ParentChildLin
     depth: input.depth,
     profile: text(input.profile, 'profile'),
     status: input.status,
+    ...(terminalStatus === undefined ? {} : { terminalStatus }),
     ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
     ...(input.updatedAt === undefined ? {} : { updatedAt: input.updatedAt }),
   }
@@ -77,15 +87,54 @@ function validateAfterSequence(value: number | undefined): number {
   return value
 }
 
-function terminalStatus(type: ParentChildLineageEventType): ParentChildLineageStatus | undefined {
+function isFileMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { readonly code?: unknown }).code === 'ENOENT'
+}
+
+function cloneDescriptor(descriptor: ParentChildLineageDescriptor): ParentChildLineageDescriptor {
+  return { ...descriptor }
+}
+
+function cloneEvent(event: ParentChildLineageEvent): ParentChildLineageEvent {
+  return { ...event }
+}
+
+function eventTerminalStatus(type: ParentChildLineageEventType): ParentChildLineageTerminalStatus | undefined {
   if (type === 'result') return 'completed'
-  if (type === 'error') return 'failed'
+  if (type === 'failure') return 'failed'
   if (type === 'cancel') return 'canceled'
+  if (type === 'archive') return 'archived'
   return undefined
 }
 
-function isFileMissing(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { readonly code?: unknown }).code === 'ENOENT'
+function transitionDescriptor(current: ParentChildLineageDescriptor, type: ParentChildLineageEventType, timestamp: string): ParentChildLineageDescriptor {
+  const terminal = eventTerminalStatus(type)
+  if (type === 'create') return cloneDescriptor(current)
+  if (type === 'start') {
+    if (current.status !== 'running' || current.terminalStatus !== undefined) throw new Error(`cannot start lineage in ${current.status} state`)
+    return { ...current, updatedAt: timestamp }
+  }
+  if (type === 'progress') {
+    if ((current.status !== 'running' && current.status !== 'detached') || current.terminalStatus !== undefined) throw new Error(`cannot append progress to ${current.status} lineage`)
+    return { ...current, updatedAt: timestamp }
+  }
+  if (type === 'resume') {
+    if (current.status === 'archived') throw new Error('cannot resume archived lineage')
+    const { terminalStatus: _terminalStatus, ...active } = current
+    return { ...active, status: 'running', updatedAt: timestamp }
+  }
+  if (type === 'detach') {
+    if (current.status === 'archived') throw new Error('cannot detach archived lineage')
+    return { ...current, status: 'detached', updatedAt: timestamp }
+  }
+  if (type === 'archive') {
+    if (current.status === 'archived') throw new Error('lineage is already archived')
+    return { ...current, status: 'archived', terminalStatus: 'archived', updatedAt: timestamp }
+  }
+  if (terminal === undefined) throw new Error(`unsupported lineage transition ${type}`)
+  if (current.terminalStatus !== undefined) throw new Error(`lineage is already terminal: ${current.terminalStatus}`)
+  if (current.status !== 'running' && current.status !== 'detached') throw new Error(`cannot finish lineage in ${current.status} state`)
+  return { ...current, status: terminal, terminalStatus: terminal, updatedAt: timestamp }
 }
 
 export function createParentChildLineageStore(file = defaultFile(), initial?: ParentChildLineageDocument): ParentChildLineageStore {
@@ -120,14 +169,61 @@ export function createParentChildLineageStore(file = defaultFile(), initial?: Pa
 
   for (const descriptor of initial?.descriptors ?? []) {
     const valid = validateDescriptor(descriptor)
+    if (descriptors.has(valid.childSessionId)) throw new Error(`duplicate lineage descriptor for child session ${valid.childSessionId}`)
     descriptors.set(valid.childSessionId, valid)
   }
   for (const event of initial?.events ?? []) {
     if (!Number.isSafeInteger(event.sequence) || event.sequence < 1) throw new RangeError('lineage event sequence must be positive')
-    const list = events.get(event.parentSessionId) ?? []
-    list.push({ ...event })
-    events.set(event.parentSessionId, list)
-    nextSequences.set(event.parentSessionId, Math.max(nextSequences.get(event.parentSessionId) ?? 0, event.sequence))
+    const parentSessionId = text(event.parentSessionId, 'parentSessionId')
+    const nativeTaskId = text(event.nativeTaskId, 'nativeTaskId')
+    const childSessionId = text(event.childSessionId, 'childSessionId')
+    if (event.type !== 'create' && event.type !== 'start' && event.type !== 'progress' && event.type !== 'result' && event.type !== 'failure' && event.type !== 'cancel' && event.type !== 'archive' && event.type !== 'detach' && event.type !== 'resume') throw new TypeError('invalid lineage event type')
+    const descriptor = descriptors.get(childSessionId)
+    if (descriptor === undefined || descriptor.parentSessionId !== parentSessionId || descriptor.nativeTaskId !== nativeTaskId) throw new Error('lineage event does not match its descriptor')
+    const list = events.get(parentSessionId) ?? []
+    if (list.some(candidate => candidate.sequence === event.sequence)) throw new Error(`duplicate lineage event sequence ${event.sequence}`)
+    list.push({ ...event, parentSessionId, nativeTaskId, childSessionId })
+    events.set(parentSessionId, list)
+    nextSequences.set(parentSessionId, Math.max(nextSequences.get(parentSessionId) ?? 0, event.sequence))
+  }
+  for (const list of events.values()) list.sort((left, right) => left.sequence - right.sequence)
+  for (const descriptor of [...descriptors.values()]) {
+    const hasEvents = [...events.values()].some(list => list.some(event => event.childSessionId === descriptor.childSessionId))
+    if (!hasEvents) continue
+    const { terminalStatus: _terminalStatus, ...base } = descriptor
+    descriptors.set(descriptor.childSessionId, { ...base, status: 'running', ...(descriptor.createdAt ?? descriptor.updatedAt) === undefined ? {} : { updatedAt: descriptor.createdAt ?? descriptor.updatedAt } })
+  }
+
+  for (const list of events.values()) {
+    for (const event of list) {
+      const current = descriptors.get(event.childSessionId)
+      if (current === undefined) throw new Error(`lineage not found for child session ${event.childSessionId}`)
+      descriptors.set(event.childSessionId, transitionDescriptor(current, event.type, event.timestamp))
+    }
+  }
+
+
+  const appendEvent = (input: Omit<ParentChildLineageEvent, 'sequence' | 'timestamp'> & { readonly timestamp?: string }): ParentChildLineageEvent => {
+    const parentSessionId = text(input.parentSessionId, 'parentSessionId')
+    const nativeTaskId = text(input.nativeTaskId, 'nativeTaskId')
+    const childSessionId = text(input.childSessionId, 'childSessionId')
+    const descriptor = descriptors.get(childSessionId)
+    if (descriptor === undefined) throw new Error(`lineage not found for child session ${childSessionId}`)
+    if (descriptor.parentSessionId !== parentSessionId || descriptor.nativeTaskId !== nativeTaskId) throw new Error('lineage event does not match its descriptor')
+    const priorEvents = events.get(parentSessionId) ?? []
+    if (input.type === 'create' && priorEvents.some(event => event.childSessionId === childSessionId && event.type === 'create')) throw new Error(`lineage was already created for child session ${childSessionId}`)
+    const timestamp = input.timestamp ?? new Date().toISOString()
+    const nextDescriptor = transitionDescriptor(descriptor, input.type, timestamp)
+    const sequence = (nextSequences.get(parentSessionId) ?? 0) + 1
+    const event: ParentChildLineageEvent = { ...input, parentSessionId, nativeTaskId, childSessionId, sequence, timestamp }
+    const list = events.get(parentSessionId) ?? []
+    list.push(event)
+    events.set(parentSessionId, list)
+    nextSequences.set(parentSessionId, sequence)
+    descriptors.set(childSessionId, nextDescriptor)
+    for (const listener of [...listeners.get(parentSessionId) ?? []]) listener(cloneEvent(event))
+    void persist()
+    return cloneEvent(event)
   }
 
   const store: ParentChildLineageStore = {
@@ -135,61 +231,69 @@ export function createParentChildLineageStore(file = defaultFile(), initial?: Pa
       const descriptor = validateDescriptor(input)
       if (descriptors.has(descriptor.childSessionId)) throw new Error(`lineage already exists for child session ${descriptor.childSessionId}`)
       const now = new Date().toISOString()
-      const stored = { ...descriptor, createdAt: descriptor.createdAt ?? now, updatedAt: descriptor.updatedAt ?? now }
-      descriptors.set(stored.childSessionId, stored)
-      void persist()
-      return { ...stored }
+      const stored: ParentChildLineageDescriptor = {
+        parentSessionId: descriptor.parentSessionId,
+        nativeTaskId: descriptor.nativeTaskId,
+        childSessionId: descriptor.childSessionId,
+        depth: descriptor.depth,
+        profile: descriptor.profile,
+        status: 'running',
+        createdAt: descriptor.createdAt ?? now,
+        updatedAt: descriptor.updatedAt ?? now,
+      }
+      // A newly created descriptor is always an active delegation run.
+      const withoutUndefined = stored
+      descriptors.set(withoutUndefined.childSessionId, withoutUndefined)
+      appendEvent({ parentSessionId: withoutUndefined.parentSessionId, nativeTaskId: withoutUndefined.nativeTaskId, childSessionId: withoutUndefined.childSessionId, type: 'create', ...withoutUndefined.createdAt === undefined ? {} : { timestamp: withoutUndefined.createdAt } })
+      return cloneDescriptor(descriptors.get(withoutUndefined.childSessionId)!)
     },
     update: (childSessionId, patch) => {
       const id = text(childSessionId, 'childSessionId')
       const current = descriptors.get(id)
       if (current === undefined) throw new Error(`lineage not found for child session ${id}`)
-      const stored = patch.status === undefined ? current : { ...current, status: patch.status, updatedAt: new Date().toISOString() }
-      descriptors.set(id, stored)
-      void persist()
-      return { ...stored }
+      if (patch.status === undefined || patch.status === current.status) return cloneDescriptor(current)
+      const type: ParentChildLineageEventType = patch.status === 'running'
+        ? 'resume'
+        : patch.status === 'completed'
+          ? 'result'
+          : patch.status === 'failed'
+            ? 'failure'
+            : patch.status === 'canceled'
+              ? 'cancel'
+              : patch.status === 'archived'
+                ? 'archive'
+                : 'detach'
+      appendEvent({ parentSessionId: current.parentSessionId, nativeTaskId: current.nativeTaskId, childSessionId: id, type })
+      return cloneDescriptor(descriptors.get(id)!)
     },
     get: (parentSessionId, nativeTaskId) => {
       const parent = text(parentSessionId, 'parentSessionId')
       const task = text(nativeTaskId, 'nativeTaskId')
       const found = [...descriptors.values()].find(candidate => candidate.parentSessionId === parent && candidate.nativeTaskId === task)
-      return found === undefined ? undefined : { ...found }
+      return found === undefined ? undefined : cloneDescriptor(found)
     },
     getByChildSessionId: childSessionId => {
       const found = descriptors.get(text(childSessionId, 'childSessionId'))
-      return found === undefined ? undefined : { ...found }
+      return found === undefined ? undefined : cloneDescriptor(found)
     },
     list: parentSessionId => [...descriptors.values()]
       .filter(candidate => parentSessionId === undefined || candidate.parentSessionId === parentSessionId)
       .sort((left, right) => (left.createdAt ?? '').localeCompare(right.createdAt ?? ''))
-      .map(descriptor => ({ ...descriptor })),
-    append: input => {
-      const descriptor = descriptors.get(input.childSessionId)
-      if (descriptor === undefined) throw new Error(`lineage not found for child session ${input.childSessionId}`)
-      if (descriptor.parentSessionId !== input.parentSessionId || descriptor.nativeTaskId !== input.nativeTaskId) throw new Error('lineage event does not match its descriptor')
-      const sequence = (nextSequences.get(input.parentSessionId) ?? 0) + 1
-      nextSequences.set(input.parentSessionId, sequence)
-      const event: ParentChildLineageEvent = { ...input, sequence, timestamp: input.timestamp ?? new Date().toISOString() }
-      const list = events.get(input.parentSessionId) ?? []
-      list.push(event)
-      events.set(input.parentSessionId, list)
-      const status = terminalStatus(event.type)
-      if (status !== undefined) descriptors.set(event.childSessionId, { ...descriptor, status, updatedAt: event.timestamp })
-      for (const listener of [...listeners.get(input.parentSessionId) ?? []]) listener({ ...event })
-      void persist()
-      return { ...event }
-    },
+      .map(cloneDescriptor),
+    append: appendEvent,
     replay: (parentSessionId, afterSequence) => {
+      const parent = text(parentSessionId, 'parentSessionId')
       const after = validateAfterSequence(afterSequence)
-      return (events.get(parentSessionId) ?? []).filter(event => event.sequence > after).map(event => ({ ...event }))
+      return (events.get(parent) ?? []).filter(event => event.sequence > after).map(cloneEvent)
     },
     subscribe: (parentSessionId, listener) => {
-      const group = listeners.get(parentSessionId) ?? new Set<(event: ParentChildLineageEvent) => void>()
+      const parent = text(parentSessionId, 'parentSessionId')
+      const group = listeners.get(parent) ?? new Set<(event: ParentChildLineageEvent) => void>()
       group.add(listener)
-      listeners.set(parentSessionId, group)
+      listeners.set(parent, group)
       return () => {
         group.delete(listener)
-        if (group.size === 0) listeners.delete(parentSessionId)
+        if (group.size === 0) listeners.delete(parent)
       }
     },
     serialize: () => JSON.stringify({ version: 1, descriptors: [...descriptors.values()], events: [...events.values()].flat() } satisfies ParentChildLineageDocument),

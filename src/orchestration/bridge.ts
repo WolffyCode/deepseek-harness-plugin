@@ -14,6 +14,7 @@ export interface EngineSuiteChildBridgeRequest {
 export interface EngineSuiteChildBridgeResult {
   readonly childSessionId: string
   readonly text: string
+  readonly nativeTaskId?: string
 }
 
 export type EngineSuiteChildBridgeHandler = (
@@ -60,6 +61,10 @@ function textField(value: unknown, label: string): string {
   return value.trim()
 }
 
+function loopback(address: string | undefined): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
 function authorized(candidate: string | undefined, token: string): boolean {
   if (candidate === undefined) return false
   const left = Buffer.from(candidate)
@@ -78,6 +83,7 @@ function mcpServerModule(): { readonly command: string; readonly args: readonly 
 export class EngineSuiteChildBridge {
   private readonly token = crypto.randomUUID()
   private readonly server = createServer((request, response) => { void this.handle(request, response) })
+  private readonly parents = new Set<string>()
   private address: string | undefined
   private started: Promise<void> | undefined
 
@@ -110,7 +116,9 @@ export class EngineSuiteChildBridge {
   }
 
   launchFor(parentSessionId: string): EngineSuiteChildBridgeLaunch {
+    const parent = textField(parentSessionId, 'parentSessionId')
     if (this.address === undefined) throw new Error('child bridge has not started')
+    this.parents.add(parent)
     const server = mcpServerModule()
     return {
       serverUrl: this.address,
@@ -118,16 +126,20 @@ export class EngineSuiteChildBridge {
       environment: {
         DSH_ENGINE_SUITE_BRIDGE_URL: this.address,
         DSH_ENGINE_SUITE_BRIDGE_TOKEN: this.token,
-        DSH_ENGINE_SUITE_PARENT_SESSION: parentSessionId,
+        DSH_ENGINE_SUITE_PARENT_SESSION: parent,
       },
       mcpServer: {
         id: 'engine-suite-delegate',
         name: 'Engine Suite Child Agent Delegation',
         transport: 'stdio',
         command: server.command,
-        args: [...server.args, '--parent-session', parentSessionId, '--url', this.address],
+        args: [...server.args, '--parent-session', parent, '--url', this.address],
       },
     }
+  }
+
+  release(parentSessionId: string): void {
+    this.parents.delete(textField(parentSessionId, 'parentSessionId'))
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -135,21 +147,30 @@ export class EngineSuiteChildBridge {
       json(response, 404, { error: 'not found' })
       return
     }
+    if (!loopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'local child bridge only' })
+      return
+    }
+    if (!authorized(request.headers['x-dsh-engine-suite-token']?.toString(), this.token)) {
+      json(response, 401, { error: 'unauthorized' })
+      return
+    }
     try {
-      if (!authorized(request.headers['x-dsh-engine-suite-token']?.toString(), this.token)) {
-        json(response, 401, { error: 'unauthorized' })
-        return
-      }
       const value = requestRecord(await body(request))
+      const allowed = new Set(['parentSessionId', 'profileId', 'task', 'nativeTaskId'])
+      for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`unsupported child bridge field: ${key}`)
+      const parentSessionId = textField(value['parentSessionId'], 'parentSessionId')
+      if (!this.parents.has(parentSessionId)) throw new Error('parentSessionId is not authorized for this bridge')
       const parsed: EngineSuiteChildBridgeRequest = {
-        parentSessionId: textField(value['parentSessionId'], 'parentSessionId'),
+        parentSessionId,
         profileId: textField(value['profileId'], 'profileId'),
         task: textField(value['task'], 'task'),
         ...(value['nativeTaskId'] === undefined ? {} : { nativeTaskId: textField(value['nativeTaskId'], 'nativeTaskId') }),
       }
-      json(response, 200, { ok: true, value: await this.handler(parsed) })
+      const result = await this.handler(parsed)
+      json(response, 200, { ok: true, value: result })
     } catch (error: unknown) {
-      json(response, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      json(response, 400, { ok: false, error: error instanceof Error ? error.message : 'child bridge request rejected' })
     }
   }
 }

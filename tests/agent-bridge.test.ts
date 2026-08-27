@@ -6,6 +6,7 @@ import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-ses
 import test from 'node:test'
 import { apply } from '../src/index.js'
 import type { EngineSuiteRuntimeService } from '../src/plugin.js'
+import { EngineSuiteChildBridge } from '../src/orchestration/bridge.js'
 
 function fakeCodexServer(): string {
   return [
@@ -262,6 +263,7 @@ test('EngineSuite delegates an authorized child Agent across Engine Profiles wit
   try {
     const result = await suite.agents.delegate('parent-agent', { profileId: 'child-profile', task: 'child task', apiKey: 'child-secret', executable: process.execPath, args: ['-e', fakeCodexServer()] })
     assert.equal(result.handle.parentSessionId, 'parent-agent')
+    assert.equal(result.handle.nativeTaskId, result.lineage.nativeTaskId)
     assert.equal(result.handle.delegationDepth, 1)
     assert.match(result.text, /fixture answer child-model/)
     assert.equal(result.handle.session.header.parentSession, 'parent-agent')
@@ -336,5 +338,49 @@ test('EngineSuite keeps Engine locked after conversation but resumes the same CL
     )
   } finally {
     await handle.dispose()
+  }
+})
+
+
+test('child delegation bridge binds the parent source and rejects credentials or unknown fields', async () => {
+  const received: unknown[] = []
+  const bridge = new EngineSuiteChildBridge(async request => {
+    received.push(request)
+    return { childSessionId: 'child-secure', text: 'ok', ...request.nativeTaskId === undefined ? {} : { nativeTaskId: request.nativeTaskId } }
+  })
+  await bridge.start()
+  try {
+    const launch = bridge.launchFor('parent-secure')
+    assert.equal('OPENAI_API_KEY' in launch.environment, false)
+    assert.equal(Object.keys(launch.environment).some(key => /key|token|credential/iu.test(key) && key !== 'DSH_ENGINE_SUITE_BRIDGE_TOKEN'), false)
+    const rejectedParent = await fetch(`${launch.serverUrl}/delegate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-engine-suite-token': launch.token },
+      body: JSON.stringify({ parentSessionId: 'other-parent', profileId: 'child', task: 'run' }),
+    })
+    assert.equal(rejectedParent.status, 400)
+    const rejectedCredential = await fetch(`${launch.serverUrl}/delegate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-engine-suite-token': launch.token },
+      body: JSON.stringify({ parentSessionId: 'parent-secure', profileId: 'child', task: 'run', apiKey: 'must-not-cross' }),
+    })
+    assert.equal(rejectedCredential.status, 400)
+    const accepted = await fetch(`${launch.serverUrl}/delegate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-engine-suite-token': launch.token },
+      body: JSON.stringify({ parentSessionId: 'parent-secure', profileId: 'child', task: 'run', nativeTaskId: 'trace-1' }),
+    })
+    assert.equal(accepted.status, 200)
+    assert.deepEqual(await accepted.json(), { ok: true, value: { childSessionId: 'child-secure', text: 'ok', nativeTaskId: 'trace-1' } })
+    assert.deepEqual(received, [{ parentSessionId: 'parent-secure', profileId: 'child', task: 'run', nativeTaskId: 'trace-1' }])
+    bridge.release('parent-secure')
+    const released = await fetch(`${launch.serverUrl}/delegate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-engine-suite-token': launch.token },
+      body: JSON.stringify({ parentSessionId: 'parent-secure', profileId: 'child', task: 'run' }),
+    })
+    assert.equal(released.status, 400)
+  } finally {
+    await bridge.close()
   }
 })

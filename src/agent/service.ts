@@ -19,6 +19,7 @@ import { ExternalEngineBindingStore } from '../engine/bindings.js'
 import { ExternalEngineAgent } from './external-engine-agent.js'
 import { latestWorkspacePermission } from '../permission.js'
 import { createCodexServerRequestHandler } from '../codex/requests.js'
+import { normalizeExternalEngineEvent } from './runtime.js'
 import type { AgentStreamEvent } from './provider-contract.js'
 import type { JsonObject, JsonValue } from '../codex/json-rpc.js'
 import type { EngineSuiteCommandView } from '../types.js'
@@ -226,6 +227,7 @@ export class EngineSuiteAgentService implements AgentFactory {
   private readonly childBridgeReady: Promise<void>
   private readonly lineageStore: ParentChildLineageStore
   private readonly closedSessions = new Map<string, Session>()
+  private readonly childReservations = new Map<string, number>()
 
   constructor(
     private readonly ctx: Context,
@@ -283,7 +285,8 @@ export class EngineSuiteAgentService implements AgentFactory {
     const depth = parent.delegationDepth + 1
     if (depth > parentProfile.maxChildDepth) throw new Error(`child delegation depth ${depth} exceeds profile limit ${parentProfile.maxChildDepth}`)
     const currentChildren = this.children.get(parentSessionId) ?? new Set<EngineSuiteAgentHandle>()
-    if (currentChildren.size >= parentProfile.maxConcurrentChildren) {
+    const reservations = this.childReservations.get(parentSessionId) ?? 0
+    if (currentChildren.size + reservations >= parentProfile.maxConcurrentChildren) {
       throw new Error(`profile ${parent.profileId} reached its child concurrency limit of ${parentProfile.maxConcurrentChildren}`)
     }
     if (request.task.trim().length === 0) throw new Error('child task must not be empty')
@@ -297,24 +300,26 @@ export class EngineSuiteAgentService implements AgentFactory {
       profile: request.profileId,
       status: 'running',
     })
-    if (childDefinition.selection.engineId === 'deepseek-native') {
-      return this.delegateNative(parent, request, childDefinition.selection, depth, currentChildren, lineage)
-    }
-    const ownerCtx = parent.agent.ctx
-    const sessions = ownerCtx.get('sessions')
-    if (sessions === undefined) throw new Error('Engine Suite requires Harness SessionStore for child delegation')
-    const childSession = sessions.prepare(childSessionId, {
-      meta: {
-        cwd: parent.session.header.cwd ?? process.cwd(),
-        parentSession: SessionId(parentSessionId),
-        origin: 'subagent',
-        delegationDepth: depth,
-        agentPreset: request.profileId,
-      },
-    })
-    const provider = this.suite.providers.get(childDefinition.selection.providerId)
+    this.lineageStore.append({ parentSessionId, nativeTaskId, childSessionId: String(childSessionId), type: 'start' })
+    this.childReservations.set(parentSessionId, reservations + 1)
     let child: EngineSuiteAgentHandle | undefined
     try {
+      if (childDefinition.selection.engineId === 'deepseek-native') {
+        return await this.delegateNative(parent, request, childDefinition.selection, depth, currentChildren, lineage)
+      }
+      const ownerCtx = parent.agent.ctx
+      const sessions = ownerCtx.get('sessions')
+      if (sessions === undefined) throw new Error('Engine Suite requires Harness SessionStore for child delegation')
+      const childSession = sessions.prepare(childSessionId, {
+        meta: {
+          cwd: parent.session.header.cwd ?? process.cwd(),
+          parentSession: SessionId(parentSessionId),
+          origin: 'subagent',
+          delegationDepth: depth,
+          agentPreset: request.profileId,
+        },
+      })
+      const provider = this.suite.providers.get(childDefinition.selection.providerId)
       child = await this.createExternalOn(ownerCtx, {
         sessionId: String(childSessionId),
         selection: childDefinition.selection,
@@ -337,16 +342,22 @@ export class EngineSuiteAgentService implements AgentFactory {
       const failure = turnFailure(child.session)
       if (failure !== undefined) throw new Error(failure)
       const text = assistantText(child.session)
-      if (this.lineageStore.getByChildSessionId(String(child.session.id))?.status === 'running') {
+      const current = this.lineageStore.getByChildSessionId(String(child.session.id))
+      if ((current?.status === 'running' || current?.status === 'detached') && current.terminalStatus === undefined) {
         this.lineageStore.append({ parentSessionId, nativeTaskId, childSessionId: String(child.session.id), type: 'result', data: text })
       }
       return { handle: child, text, lineage: this.lineageStore.getByChildSessionId(String(child.session.id)) ?? lineage }
     } catch (error: unknown) {
-      if (this.lineageStore.getByChildSessionId(String(childSessionId))?.status === 'running') {
-        this.lineageStore.append({ parentSessionId, nativeTaskId, childSessionId: String(childSessionId), type: 'error', error: error instanceof Error ? error.message : String(error) })
+      const current = this.lineageStore.getByChildSessionId(String(childSessionId))
+      if (current?.status === 'running' && current.terminalStatus === undefined) {
+        this.lineageStore.append({ parentSessionId, nativeTaskId, childSessionId: String(childSessionId), type: 'failure', error: error instanceof Error ? error.message : String(error) })
       }
       if (child !== undefined) await child.dispose().catch(() => {})
       throw error
+    } finally {
+      const remaining = (this.childReservations.get(parentSessionId) ?? 1) - 1
+      if (remaining > 0) this.childReservations.set(parentSessionId, remaining)
+      else this.childReservations.delete(parentSessionId)
     }
   }
 
@@ -407,10 +418,16 @@ export class EngineSuiteAgentService implements AgentFactory {
         } : {},
         ...binding.executable === undefined ? {} : { executable: binding.executable },
         ...binding.args === undefined ? {} : { args: [...binding.args] },
-        ...parent === undefined || lineage === undefined ? {} : { parentAgent: parent.agent, parentSessionId: String(parent.session.id), delegationDepth: lineage.depth, nativeTaskId: lineage.nativeTaskId },
+        ...lineage === undefined ? {} : { parentSessionId: lineage.parentSessionId, delegationDepth: lineage.depth, nativeTaskId: lineage.nativeTaskId },
+        ...parent === undefined ? {} : { parentAgent: parent.agent },
       })
       this.closedSessions.delete(id)
-      if (lineage !== undefined && lineage.status !== 'detached') this.lineageStore.update(id, { status: 'running' })
+      if (lineage !== undefined) {
+        const current = this.lineageStore.getByChildSessionId(id)
+        if (current !== undefined && current.status !== 'running') {
+          this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: id, type: 'resume' })
+        }
+      }
       return resumed
     } finally {
       releasePreparation?.()
@@ -437,9 +454,14 @@ export class EngineSuiteAgentService implements AgentFactory {
     const sessionId = SessionId(childSessionId)
     const id = String(sessionId)
     const live = [...this.live].find(candidate => String(candidate.session.id) === id)
-    if (live !== undefined) return live
     const lineage = this.lineageStore.getByChildSessionId(id)
     if (lineage === undefined) throw new Error(`unknown child Engine Suite session: ${id}`)
+    if (live !== undefined) {
+      if (lineage.status === 'detached') {
+        this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: id, type: 'resume' })
+      }
+      return live
+    }
     const parent = [...this.live].find(candidate => String(candidate.session.id) === lineage.parentSessionId)
     const ownerCtx = parent?.agent.ctx ?? this.ctx
     return this.resume(ownerCtx, { resumeSessionId: sessionId })
@@ -449,6 +471,7 @@ export class EngineSuiteAgentService implements AgentFactory {
     const id = String(SessionId(childSessionId))
     const lineage = this.lineageStore.getByChildSessionId(id)
     if (lineage === undefined) throw new Error(`unknown child Engine Suite session: ${id}`)
+    if (lineage.status === 'archived') return lineage
     const handle = [...this.live].find(candidate => String(candidate.session.id) === id)
     if (handle !== undefined && handle.selection.engineId === 'claude-cli') {
       const binding = await this.bindings.get(id)
@@ -458,33 +481,39 @@ export class EngineSuiteAgentService implements AgentFactory {
     }
     if (handle !== undefined) await handle.dispose()
     this.closedSessions.delete(id)
-    return this.lineageStore.update(id, { status: 'archived' })
+    this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: id, type: 'archive' })
+    return this.lineageStore.getByChildSessionId(id) ?? lineage
   }
 
   async detachChild(childSessionId: string): Promise<ParentChildLineageDescriptor> {
     const id = String(SessionId(childSessionId))
     const lineage = this.lineageStore.getByChildSessionId(id)
     if (lineage === undefined) throw new Error(`unknown child Engine Suite session: ${id}`)
+    if (lineage.status === 'archived') throw new Error(`cannot detach archived child session ${id}`)
+    if (lineage.status === 'detached') return lineage
     const handle = [...this.live].find(candidate => String(candidate.session.id) === id)
     if (handle?.parentSessionId !== undefined) {
       const children = this.children.get(handle.parentSessionId)
       children?.delete(handle)
       if (children !== undefined && children.size === 0) this.children.delete(handle.parentSessionId)
     }
-    return this.lineageStore.update(id, { status: 'detached' })
+    this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: id, type: 'detach' })
+    return this.lineageStore.getByChildSessionId(id) ?? lineage
   }
 
   async cancelChild(childSessionId: string): Promise<ParentChildLineageDescriptor> {
     const id = String(SessionId(childSessionId))
     const lineage = this.lineageStore.getByChildSessionId(id)
     if (lineage === undefined) throw new Error(`unknown child Engine Suite session: ${id}`)
+    if (lineage.status === 'archived' || lineage.terminalStatus === 'completed' || lineage.terminalStatus === 'failed' || lineage.terminalStatus === 'canceled') return lineage
     const handle = [...this.live].find(candidate => String(candidate.session.id) === id)
     if (handle !== undefined) {
       handle.agent.cancel({ kind: 'user' })
       await handle.agent.whenIdle()
     }
-    if (this.lineageStore.getByChildSessionId(id)?.status === 'running') {
-      this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: id, type: 'cancel' })
+    const current = this.lineageStore.getByChildSessionId(id)
+    if (current?.status === 'running' || current?.status === 'detached') {
+      this.lineageStore.append({ parentSessionId: current.parentSessionId, nativeTaskId: current.nativeTaskId, childSessionId: id, type: 'cancel' })
     }
     return this.lineageStore.getByChildSessionId(id) ?? lineage
   }
@@ -492,7 +521,10 @@ export class EngineSuiteAgentService implements AgentFactory {
   private async cancelChildren(parentSessionId: string): Promise<void> {
     const children = [...this.children.get(parentSessionId) ?? []]
       .filter(child => this.shouldDisposeWithParent(child))
-    await Promise.all(children.map(child => this.cancelChild(String(child.session.id)).catch(() => undefined)))
+    await Promise.all(children.map(async child => {
+      await this.cancelChild(String(child.session.id)).catch(() => undefined)
+      await child.dispose().catch(() => undefined)
+    }))
   }
 
   private shouldDisposeWithParent(child: EngineSuiteAgentHandle): boolean {
@@ -510,49 +542,60 @@ export class EngineSuiteAgentService implements AgentFactory {
     const agents = parent.agent.ctx.get('agents') as { create(options: CreateAgentOptions): Promise<AgentHandle> } | undefined
     if (agents === undefined) throw new Error('DeepSeek Native child delegation requires Harness AgentRegistry')
     const childSessionId = SessionId(lineage.childSessionId)
-    const nativeHandle = await agents.create({
-      sessionId: childSessionId,
-      meta: {
-        cwd: parent.session.header.cwd ?? process.cwd(),
-        parentSession: SessionId(String(parent.session.id)),
-        origin: 'subagent',
+    let handle: EngineSuiteAgentHandle | undefined
+    try {
+      const nativeHandle = await agents.create({
+        sessionId: childSessionId,
+        meta: {
+          cwd: parent.session.header.cwd ?? process.cwd(),
+          parentSession: SessionId(String(parent.session.id)),
+          origin: 'subagent',
+          delegationDepth: depth,
+          agentPreset: request.profileId,
+        },
+        agentOptions: { provider: selection.providerId, model: selection.modelRecordId },
+      })
+      let disposePromise: Promise<void> | undefined
+      handle = {
+        agent: nativeHandle.agent,
+        session: nativeHandle.agent.session,
+        parentSessionId: String(parent.session.id),
         delegationDepth: depth,
-        agentPreset: request.profileId,
-      },
-      agentOptions: { provider: selection.providerId, model: selection.modelRecordId },
-    })
-    let disposePromise: Promise<void> | undefined
-    const handle: EngineSuiteAgentHandle = {
-      agent: nativeHandle.agent,
-      session: nativeHandle.agent.session,
-      parentSessionId: String(parent.session.id),
-      delegationDepth: depth,
-      nativeTaskId: lineage.nativeTaskId,
-      profileId: request.profileId,
-      selection,
-      listCommands: async () => { throw new Error('slash commands are unavailable for DeepSeek Native sessions') },
-      updateSelection: async () => { throw new Error('DeepSeek Native child selection is immutable during delegation') },
-      dispose: () => {
-        if (disposePromise !== undefined) return disposePromise
-        disposePromise = (async () => {
-          this.closedSessions.set(String(handle.session.id), handle.session)
-          this.live.delete(handle)
-          currentChildren.delete(handle)
-          await nativeHandle.dispose()
-        })()
-        return disposePromise
-      },
+        nativeTaskId: lineage.nativeTaskId,
+        profileId: request.profileId,
+        selection,
+        listCommands: async () => { throw new Error('slash commands are unavailable for DeepSeek Native sessions') },
+        updateSelection: async () => { throw new Error('DeepSeek Native child selection is immutable during delegation') },
+        dispose: () => {
+          if (disposePromise !== undefined) return disposePromise
+          disposePromise = (async () => {
+            this.closedSessions.set(String(handle!.session.id), handle!.session)
+            this.live.delete(handle!)
+            currentChildren.delete(handle!)
+            await nativeHandle.dispose()
+          })()
+          return disposePromise
+        },
+      }
+      this.live.add(handle)
+      currentChildren.add(handle)
+      this.children.set(String(parent.session.id), currentChildren)
+      nativeHandle.agent.followup(createUserMessage({ content: [{ type: 'text', text: request.task }], source: { kind: 'user' } }))
+      await nativeHandle.agent.whenIdle()
+      const failure = turnFailure(nativeHandle.agent.session)
+      if (failure !== undefined) throw new Error(failure)
+      const text = assistantText(nativeHandle.agent.session)
+      const current = this.lineageStore.getByChildSessionId(lineage.childSessionId)
+      if ((current?.status === 'running' || current?.status === 'detached') && current.terminalStatus === undefined) this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'result', data: text })
+      return { handle, text, lineage: this.lineageStore.getByChildSessionId(lineage.childSessionId) ?? lineage }
+    } catch (error: unknown) {
+      const current = this.lineageStore.getByChildSessionId(lineage.childSessionId)
+      if (current?.status === 'running' && current.terminalStatus === undefined) {
+        this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'failure', error: error instanceof Error ? error.message : String(error) })
+      }
+      if (handle !== undefined) await handle.dispose().catch(() => {})
+      throw error
     }
-    this.live.add(handle)
-    currentChildren.add(handle)
-    this.children.set(String(parent.session.id), currentChildren)
-    nativeHandle.agent.followup(createUserMessage({ content: [{ type: 'text', text: request.task }], source: { kind: 'user' } }))
-    await nativeHandle.agent.whenIdle()
-    const failure = turnFailure(nativeHandle.agent.session)
-    if (failure !== undefined) throw new Error(failure)
-    const text = assistantText(nativeHandle.agent.session)
-    if (this.lineageStore.getByChildSessionId(lineage.childSessionId)?.status === 'running') this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'result', data: text })
-    return { handle, text, lineage: this.lineageStore.getByChildSessionId(lineage.childSessionId) ?? lineage }
   }
 
   private async delegateFromBridge(request: EngineSuiteChildBridgeRequest): Promise<{ readonly childSessionId: string; readonly text: string; readonly nativeTaskId: string }> {
@@ -612,27 +655,35 @@ export class EngineSuiteAgentService implements AgentFactory {
     const bridge = profile.allowedChildProfiles.length === 0
       ? undefined
       : await this.childBridgeReady.then(() => this.childBridge.launchFor(String(id)))
+    let bridgeActive = bridge !== undefined
     const environment = { ...bridge?.environment ?? {} }
     const internalMcpSet: EngineMcpSet | undefined = bridge === undefined
       ? undefined
       : { id: 'engine-suite-child-bridge', servers: [{ ...bridge.mcpServer, args: [...bridge.mcpServer.args] }] }
-    const launch = await this.suite.openEngine(options.selection, {
-      apiKey: options.apiKey,
-      cwd: options.cwd,
-      runtimeRoot,
-      preserveRuntimeRoot: options.preserveRuntimeRoot ?? true,
-      ...options.resumeThreadId === undefined ? {} : { resumeThreadId: options.resumeThreadId },
-      ...options.executable === undefined ? {} : { executable: options.executable },
-      ...options.args === undefined ? {} : { args: options.args },
-      ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
-      ...permissionPreset === undefined ? {} : { permissionPreset },
-      serverRequestHandler,
-      environment,
-      ...profile.engineId === 'codex-cli' ? { credentialResolver: this.resolveApiKey } : {},
-      ...internalMcpSet === undefined ? {} : { internalMcpSet },
-    })
+    let launch: Awaited<ReturnType<EngineSuiteRuntime['openEngine']>>
+    try {
+      launch = await this.suite.openEngine(options.selection, {
+        apiKey: options.apiKey,
+        cwd: options.cwd,
+        runtimeRoot,
+        preserveRuntimeRoot: options.preserveRuntimeRoot ?? true,
+        ...options.resumeThreadId === undefined ? {} : { resumeThreadId: options.resumeThreadId },
+        ...options.executable === undefined ? {} : { executable: options.executable },
+        ...options.args === undefined ? {} : { args: options.args },
+        ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
+        ...permissionPreset === undefined ? {} : { permissionPreset },
+        serverRequestHandler,
+        environment,
+        ...profile.engineId === 'codex-cli' ? { credentialResolver: this.resolveApiKey } : {},
+        ...internalMcpSet === undefined ? {} : { internalMcpSet },
+      })
+    } catch (error: unknown) {
+      if (bridgeActive) this.childBridge.release(String(id))
+      throw error
+    }
     let detachSession: (() => void) | undefined
     let detachAgent: (() => void) | undefined
+    let detachLineageRuntime: (() => void) | undefined
     try {
       const existingHeader = session.requestHeader()
       if (existingHeader === undefined || !sessionHasConversation(session)) {
@@ -683,10 +734,21 @@ export class EngineSuiteAgentService implements AgentFactory {
       let commandOperation: Promise<readonly EngineSuiteCommandView[]> | undefined
       let commandClosed = false
       let disposePromise: Promise<void> | undefined
+      const lineage = options.parentSessionId === undefined || options.nativeTaskId === undefined
+        ? undefined
+        : this.lineageStore.getByChildSessionId(String(id))
+      const observeRuntime = (runtime: import('./runtime.js').ExternalEngineRuntime, runtimeProvider = provider.id): void => {
+        if (lineage === undefined) return
+        detachLineageRuntime = runtime.onEvent(rawEvent => {
+          const event = normalizeExternalEngineEvent(rawEvent, runtimeProvider, runtime.turnId)
+          if (event !== undefined) this.observeChildRuntimeEvent(lineage, event)
+        })
+      }
       const handle: EngineSuiteAgentHandle = {
         agent,
         session,
         ...options.parentSessionId === undefined ? {} : { parentSessionId: options.parentSessionId },
+        ...options.nativeTaskId === undefined ? {} : { nativeTaskId: options.nativeTaskId },
         delegationDepth: options.delegationDepth ?? session.header.delegationDepth ?? 0,
         profileId: profile.id,
         selection: options.selection,
@@ -753,6 +815,7 @@ export class EngineSuiteAgentService implements AgentFactory {
               throw new Error(`External engine did not publish a native session id for ${String(id)}`)
             }
           } catch (error: unknown) {
+            if (nextBridge !== undefined && !bridgeActive) this.childBridge.release(String(id))
             try {
               const previousPermissionPreset = latestWorkspacePermission(session)
               const restored = await this.suite.openEngine(previousSelection, {
@@ -778,8 +841,13 @@ export class EngineSuiteAgentService implements AgentFactory {
             }
             throw error
           }
+          detachLineageRuntime?.()
+          detachLineageRuntime = undefined
           agent!.replaceRuntime(nextLaunch.runtime, nextProvider.id, nextModel.modelId)
           activeLaunch = nextLaunch
+          observeRuntime(activeLaunch.runtime, nextProvider.id)
+          if (bridgeActive && nextBridge === undefined) this.childBridge.release(String(id))
+          bridgeActive = nextBridge !== undefined
           activeApiKey = nextApiKey
           activeEnvironment = nextEnvironment
           activeInternalMcpSet = nextInternalMcpSet
@@ -804,15 +872,16 @@ export class EngineSuiteAgentService implements AgentFactory {
         dispose: () => {
           if (disposePromise !== undefined) return disposePromise
           disposePromise = (async () => {
-            const childHandles = [...this.children.get(String(id)) ?? []]
-              .filter(child => this.shouldDisposeWithParent(child))
-            await Promise.all(childHandles.map(child => child.dispose()))
+            await this.cancelChildren(String(id))
             this.children.delete(String(id))
             this.closedSessions.set(String(id), session)
             this.live.delete(handle)
             commandClosed = true
             commandCatalog = undefined
             commandOperation = undefined
+            detachLineageRuntime?.()
+            detachLineageRuntime = undefined
+            if (bridgeActive) this.childBridge.release(String(id))
             if (options.parentSessionId !== undefined) {
               const siblings = this.children.get(options.parentSessionId)
               siblings?.delete(handle)
@@ -826,6 +895,7 @@ export class EngineSuiteAgentService implements AgentFactory {
           return disposePromise
         },
       }
+      observeRuntime(activeLaunch.runtime)
       this.live.add(handle)
       ownerCtx.effect(() => () => {
         if (this.shouldDisposeWithParent(handle)) void handle.dispose()
@@ -833,6 +903,9 @@ export class EngineSuiteAgentService implements AgentFactory {
       await this.attachWorkspace(ownerCtx, session.header.cwd ?? options.cwd, id)
       return handle
     } catch (error: unknown) {
+      detachLineageRuntime?.()
+      detachLineageRuntime = undefined
+      if (bridgeActive) this.childBridge.release(String(id))
       await agent?.dispose().catch(() => {})
       detachAgent?.()
       detachSession?.()
@@ -843,12 +916,14 @@ export class EngineSuiteAgentService implements AgentFactory {
 
   private observeChildRuntimeEvent(lineage: ParentChildLineageDescriptor, event: AgentStreamEvent): void {
     const current = this.lineageStore.getByChildSessionId(lineage.childSessionId)
-    if (current === undefined || current.status !== 'running') return
+    if (current === undefined || current.terminalStatus !== undefined || (current.status !== 'running' && current.status !== 'detached')) return
     if (event.type === 'timeline') {
       const data = event.item.type === 'assistant_message' || event.item.type === 'reasoning' ? event.item.text : JSON.stringify(event.item)
       this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'progress', ...(data === undefined ? {} : { data }), ...(event.timestamp === undefined ? {} : { timestamp: event.timestamp }) })
+    } else if (event.type === 'reasoning') {
+      this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'progress', data: event.text })
     } else if (event.type === 'turn_failed' || event.type === 'error') {
-      this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'error', error: event.error })
+      this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'failure', error: event.error })
     } else if (event.type === 'turn_canceled') {
       this.lineageStore.append({ parentSessionId: lineage.parentSessionId, nativeTaskId: lineage.nativeTaskId, childSessionId: lineage.childSessionId, type: 'cancel', data: event.reason })
     }

@@ -54,6 +54,7 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     private readonly childBridgeReady;
     private readonly lineageStore;
     private readonly closedSessions;
+    private readonly childReservations;
     constructor(ctx: Context, suite: EngineSuiteRuntime, resolveApiKey: (credentialRef: string) => string | Promise<string>, catalogReady?: Promise<void>, bindings?: ExternalEngineBindingStore, lineageStore?: ParentChildLineageStore);
     createExternal(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;
     createCodex(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;

@@ -246,3 +246,109 @@ test("the public event union follows the provider event categories", () => {
   ];
   assert.equal(events.length, 14);
 });
+
+test("Codex-only details normalize into provider-neutral metadata without protocol names", () => {
+  const command = normalizeExternalEngineEvent({
+    type: "tool-call",
+    turnId: "turn",
+    id: "command",
+    name: "command_execution",
+    itemType: "commandExecution",
+    item: { type: "commandExecution", command: "printf ok", cwd: "/tmp" },
+  }, "codex-cli");
+  assert.equal(command?.type, "timeline");
+  if (command?.type === "timeline") {
+    assert.deepEqual(command.item.metadata, { tool: { kind: "command", command: "printf ok", cwd: "/tmp" } });
+    assert.doesNotMatch(JSON.stringify(command), /commandExecution/);
+  }
+
+  const file = normalizeExternalEngineEvent({
+    type: "tool-result",
+    turnId: "turn",
+    id: "file",
+    name: "file_change",
+    isError: false,
+    output: "updated",
+    itemType: "fileChange",
+    item: { type: "fileChange", changes: [{ path: "a.txt", kind: "update" }], patch: "@@" },
+  }, "codex-cli");
+  assert.equal(file?.type, "timeline");
+  if (file?.type === "timeline") {
+    assert.deepEqual(file.item.metadata, { file: { paths: ["a.txt"], changes: [{ path: "a.txt", kind: "update" }], patch: "@@" } });
+    assert.doesNotMatch(JSON.stringify(file), /fileChange/);
+  }
+
+  const mcp = normalizeExternalEngineEvent({
+    type: "tool-call",
+    id: "mcp",
+    name: "lookup",
+    itemType: "mcpToolCall",
+    item: { type: "mcpToolCall", server: "fixture-server", tool: "lookup" },
+  }, "codex-cli");
+  assert.equal(mcp?.type, "timeline");
+  if (mcp?.type === "timeline") assert.deepEqual(mcp.item.metadata, { mcp: { server: "fixture-server", tool: "lookup" } });
+
+  const reasoning = normalizeExternalEngineEvent({
+    type: "reasoning",
+    text: "summary",
+    stream: "summary",
+    contentIndex: 2,
+    summaryIndex: 4,
+  }, "codex-cli");
+  assert.equal(reasoning?.type, "reasoning");
+  if (reasoning?.type === "reasoning") assert.deepEqual(reasoning.metadata, { reasoning: { stream: "summary", contentIndex: 2, summaryIndex: 4 } });
+
+  const usage = normalizeExternalEngineEvent({
+    type: "usage_updated",
+    usage: { inputTokens: 12, outputTokens: 7, contextWindowMaxTokens: 128000 },
+    tokenUsage: {
+      total: { inputTokens: 12, cachedInputTokens: 3, outputTokens: 7 },
+      last: { inputTokens: 8, cachedInputTokens: 2, outputTokens: 4 },
+      modelContextWindow: 128000,
+    },
+  }, "codex-cli");
+  assert.equal(usage?.type, "usage_updated");
+  if (usage?.type === "usage_updated") {
+    assert.deepEqual(usage.usage, {
+      inputTokens: 12,
+      outputTokens: 7,
+      contextWindowMaxTokens: 128000,
+      breakdown: {
+        total: { inputTokens: 12, cachedInputTokens: 3, outputTokens: 7 },
+        turn: { inputTokens: 8, cachedInputTokens: 2, outputTokens: 4 },
+      },
+    });
+    assert.doesNotMatch(JSON.stringify(usage), /tokenUsage/);
+  }
+
+  const failed = normalizeExternalEngineEvent({
+    type: "turn_failed",
+    turnId: "turn",
+    error: "turn exploded",
+    errorDetails: { message: "turn exploded", additionalDetails: "diagnostic", codexErrorInfo: { code: "turn_failed" } },
+  }, "codex-cli");
+  assert.equal(failed?.type, "turn_failed");
+  if (failed?.type === "turn_failed") {
+    assert.deepEqual(failed.metadata, { error: { message: "turn exploded", code: "turn_failed", diagnostic: "diagnostic" } });
+    assert.doesNotMatch(JSON.stringify(failed), /codexErrorInfo|errorDetails/);
+  }
+
+  const request = normalizeExternalEngineEvent({
+    type: "server-request",
+    turnId: "turn",
+    method: "item/commandExecution/requestApproval",
+    requestId: "request-1",
+    params: { command: "printf ok", cwd: "/tmp" },
+  }, "codex-cli");
+  assert.equal(request?.type, "server_request");
+  if (request?.type === "server_request") {
+    assert.deepEqual(request.request, { kind: "command_approval", id: "request-1", input: { command: "printf ok", cwd: "/tmp" } });
+    assert.doesNotMatch(JSON.stringify(request), /item\/commandExecution/);
+  }
+});
+
+test("unknown and private external notifications remain outside the public event union", () => {
+  assert.equal(normalizeExternalEngineEvent({ type: "unknown-notification", method: "private/event" }, "codex-cli"), undefined);
+  assert.equal(normalizeExternalEngineEvent({ type: "private-text", text: "not a user-visible answer" }, "codex-cli"), undefined);
+  assert.equal(normalizeExternalEngineEvent({ type: "server-request", method: "private/request" }, "codex-cli"), undefined);
+});

@@ -1,5 +1,6 @@
 export type ParentChildLineageStatus = 'running' | 'completed' | 'failed' | 'canceled' | 'archived' | 'detached';
-export type ParentChildLineageEventType = 'progress' | 'result' | 'error' | 'cancel';
+export type ParentChildLineageEventType = 'create' | 'start' | 'progress' | 'result' | 'failure' | 'cancel' | 'archive' | 'detach' | 'resume';
+export type ParentChildLineageTerminalStatus = 'completed' | 'failed' | 'canceled' | 'archived';
 export interface ParentChildLineageDescriptor {
     readonly parentSessionId: string;
     readonly nativeTaskId: string;
@@ -7,6 +8,8 @@ export interface ParentChildLineageDescriptor {
     readonly depth: number;
     readonly profile: string;
     readonly status: ParentChildLineageStatus;
+    /** Execution terminal for the current delegation run; detached is a relationship state. */
+    readonly terminalStatus?: ParentChildLineageTerminalStatus;
     readonly createdAt?: string;
     readonly updatedAt?: string;
 }

@@ -1,19 +1,24 @@
 import type { JsonRpcLineTransport } from "../codex/json-rpc.js";
 import type {
+  AgentEventMetadata,
   AgentMetadata,
   AgentMode,
   AgentModel,
   AgentPermissionRequest,
   AgentPermissionResponse,
+  AgentServerRequest,
   AgentProvider,
   AgentRuntimeInfo,
   AgentStreamEvent,
+  AgentStructuredError,
   AgentTimelineItem,
   AgentUsage,
+  AgentUsageBreakdown,
   ProviderSubagentEvent,
 } from "./provider-contract.js";
 
 /** Opaque transport payload; the public stream vocabulary is AgentStreamEvent only. */
+export type ExternalEngineEventMetadata = AgentEventMetadata;
 export type ExternalEngineEvent = unknown;
 export type ExternalEngineEventHandler = (event: ExternalEngineEvent) => void;
 
@@ -43,9 +48,92 @@ function withTurn(event: AgentStreamEvent, turnId: string | undefined): AgentStr
   return turnId === undefined ? event : { ...event, turnId } as AgentStreamEvent;
 }
 
-function usageFrom(value: unknown): AgentUsage | undefined {
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function nonNegativeIndex(value: unknown): number | undefined {
+  const number = finiteNumber(value);
+  return number !== undefined && Number.isSafeInteger(number) && number >= 0 ? number : undefined;
+}
+
+const providerProtocolKeys = new Set(["method", "itemType", "tokenUsage", "errorDetails", "codexErrorInfo"]);
+
+function sanitizeMetadataValue(value: unknown, depth = 0): unknown {
+  if (depth > 8 || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(item => sanitizeMetadataValue(item, depth + 1));
+  const input = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(input)) {
+    if (providerProtocolKeys.has(key)) continue;
+    output[key] = sanitizeMetadataValue(nested, depth + 1);
+  }
+  return output;
+}
+
+function metadataFrom(value: unknown): AgentEventMetadata | undefined {
   const input = record(value);
   if (input === undefined) return undefined;
+  const sanitized = sanitizeMetadataValue(input);
+  const output = record(sanitized);
+  return output === undefined || Object.keys(output).length === 0 ? undefined : output as AgentEventMetadata;
+}
+
+function usageCounterFrom(value: unknown): {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+} | undefined {
+  const input = record(value);
+  if (input === undefined) return undefined;
+  const counter: {
+    inputTokens?: number;
+    cachedInputTokens?: number;
+    outputTokens?: number;
+    reasoningTokens?: number;
+    totalTokens?: number;
+  } = {};
+  const number = (...keys: string[]): number | undefined => {
+    for (const key of keys) {
+      const valueForKey = finiteNumber(input[key]);
+      if (valueForKey !== undefined) return valueForKey;
+    }
+    return undefined;
+  };
+  const values: ReadonlyArray<readonly [keyof typeof counter, number | undefined]> = [
+    ["inputTokens", number("inputTokens", "input_tokens")],
+    ["cachedInputTokens", number("cachedInputTokens", "cached_input_tokens")],
+    ["outputTokens", number("outputTokens", "output_tokens")],
+    ["reasoningTokens", number("reasoningTokens", "reasoning_tokens")],
+    ["totalTokens", number("totalTokens", "total_tokens")],
+  ];
+  for (const [key, valueForKey] of values) if (valueForKey !== undefined) counter[key] = valueForKey;
+  return Object.keys(counter).length === 0 ? undefined : counter;
+}
+
+function usageBreakdownFrom(value: unknown): AgentUsageBreakdown | undefined {
+  const input = record(value);
+  if (input === undefined) return undefined;
+  const total = usageCounterFrom(input["total"]);
+  const turn = usageCounterFrom(input["turn"] ?? input["last"]);
+  return total === undefined && turn === undefined ? undefined : {
+    ...(total === undefined ? {} : { total }),
+    ...(turn === undefined ? {} : { turn }),
+  };
+}
+
+function usageFrom(value: unknown, breakdownValue?: unknown): AgentUsage | undefined {
+  const input = record(value);
+  if (input === undefined) return undefined;
+  const nestedTotal = usageCounterFrom(input["total"]);
+  const nestedTurn = usageCounterFrom(input["turn"] ?? input["last"]);
+  const source: UnknownRecord = nestedTotal !== undefined
+    ? nestedTotal as UnknownRecord
+    : nestedTurn !== undefined
+      ? nestedTurn as UnknownRecord
+      : input;
   const usage: {
     inputTokens?: number;
     cachedInputTokens?: number;
@@ -53,18 +141,102 @@ function usageFrom(value: unknown): AgentUsage | undefined {
     totalCostUsd?: number;
     contextWindowMaxTokens?: number;
     contextWindowUsedTokens?: number;
+    breakdown?: AgentUsageBreakdown;
   } = {};
-  const numeric = (key: string): number | undefined => typeof input[key] === "number" ? input[key] as number : undefined;
-  const values: ReadonlyArray<readonly [keyof typeof usage, number | undefined]> = [
-    ["inputTokens", numeric("inputTokens") ?? numeric("input_tokens")],
-    ["cachedInputTokens", numeric("cachedInputTokens") ?? numeric("cached_input_tokens")],
-    ["outputTokens", numeric("outputTokens") ?? numeric("output_tokens")],
-    ["totalCostUsd", numeric("totalCostUsd") ?? numeric("total_cost_usd")],
-    ["contextWindowMaxTokens", numeric("contextWindowMaxTokens") ?? numeric("context_window_max_tokens")],
-    ["contextWindowUsedTokens", numeric("contextWindowUsedTokens") ?? numeric("context_window_used_tokens")],
+  const numeric = (...keys: string[]): number | undefined => {
+    for (const key of keys) {
+      const valueForKey = finiteNumber(source[key]);
+      if (valueForKey !== undefined) return valueForKey;
+    }
+    return undefined;
+  };
+  const values: ReadonlyArray<readonly [keyof Omit<typeof usage, "breakdown">, number | undefined]> = [
+    ["inputTokens", numeric("inputTokens", "input_tokens")],
+    ["cachedInputTokens", numeric("cachedInputTokens", "cached_input_tokens")],
+    ["outputTokens", numeric("outputTokens", "output_tokens")],
+    ["totalCostUsd", numeric("totalCostUsd", "total_cost_usd")],
+    ["contextWindowMaxTokens", numeric("contextWindowMaxTokens", "context_window_max_tokens", "modelContextWindow") ?? finiteNumber(input["modelContextWindow"])],
+    ["contextWindowUsedTokens", numeric("contextWindowUsedTokens", "context_window_used_tokens")],
   ];
   for (const [key, valueForKey] of values) if (valueForKey !== undefined) usage[key] = valueForKey;
-  return usage;
+  const breakdown = usageBreakdownFrom(breakdownValue) ?? usageBreakdownFrom(value);
+  if (breakdown !== undefined) usage.breakdown = breakdown;
+  return Object.keys(usage).length === 0 ? undefined : usage;
+}
+
+function structuredErrorFrom(
+  value: unknown,
+  fallbackMessage?: string,
+  code?: string,
+  diagnostic?: string,
+): AgentStructuredError | undefined {
+  const input = record(value);
+  const message = typeof value === "string" ? stringValue(value) : fieldString(input ?? {}, "message") ?? fallbackMessage;
+  if (message === undefined) return undefined;
+  const nested = record(input?.["codexErrorInfo"]);
+  const resolvedCode = code ?? fieldString(input ?? {}, "code") ?? fieldString(nested ?? {}, "code");
+  const resolvedDiagnostic = diagnostic
+    ?? fieldString(input ?? {}, "diagnostic")
+    ?? fieldString(input ?? {}, "additionalDetails");
+  const details: Record<string, unknown> = {};
+  for (const key of ["category", "retryable", "status", "requestId", "cause"]) {
+    if (input !== undefined && Object.prototype.hasOwnProperty.call(input, key)) details[key] = input[key];
+  }
+  return {
+    message,
+    ...(resolvedCode === undefined ? {} : { code: resolvedCode }),
+    ...(resolvedDiagnostic === undefined ? {} : { diagnostic: resolvedDiagnostic }),
+    ...(Object.keys(details).length === 0 ? {} : { details: details as AgentMetadata }),
+  };
+}
+
+function pathsFrom(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const paths = value.map(entry => fieldString(record(entry) ?? {}, "path")).filter((path): path is string => path !== undefined);
+  return paths.length === 0 ? undefined : [...new Set(paths)];
+}
+
+function toolMetadataFrom(value: UnknownRecord): AgentEventMetadata | undefined {
+  const item = record(value["item"]);
+  const kind = fieldString(value, "itemType") ?? fieldString(item ?? {}, "type");
+  const source = item ?? value;
+  if (kind === "commandExecution") {
+    const command = fieldString(source, "command");
+    const cwd = fieldString(source, "cwd");
+    return { tool: { kind: "command", ...(command === undefined ? {} : { command }), ...(cwd === undefined ? {} : { cwd }) } };
+  }
+  if (kind === "fileChange") {
+    const changes = source["changes"] ?? source["patch"] ?? value["changes"] ?? value["patch"];
+    const patch = source["patch"] ?? value["patch"];
+    const paths = pathsFrom(changes);
+    return { file: { ...(paths === undefined ? {} : { paths }), ...(changes === undefined ? {} : { changes }), ...(patch === undefined ? {} : { patch }) } };
+  }
+  if (kind === "mcpToolCall") {
+    const server = fieldString(source, "server");
+    const tool = fieldString(source, "tool") ?? fieldString(source, "name") ?? fieldString(value, "name");
+    return { mcp: { ...(server === undefined ? {} : { server }), ...(tool === undefined ? {} : { tool }) } };
+  }
+  if (kind === "dynamicToolCall") {
+    const name = fieldString(source, "name") ?? fieldString(source, "tool") ?? fieldString(value, "name");
+    return { tool: { kind: "dynamic", ...(name === undefined ? {} : { name }) } };
+  }
+  if (kind === "webSearch") return { tool: { kind: "web", name: "web_search" } };
+  if (kind === "computerCall" || kind === "computer_call") return { tool: { kind: "computer", name: "computer" } };
+  return undefined;
+}
+
+function reasoningMetadataFrom(value: UnknownRecord): AgentEventMetadata | undefined {
+  const stream = fieldString(value, "stream");
+  const contentIndex = nonNegativeIndex(value["contentIndex"]);
+  const summaryIndex = nonNegativeIndex(value["summaryIndex"]);
+  if (stream !== "text" && stream !== "summary" && contentIndex === undefined && summaryIndex === undefined) return undefined;
+  return {
+    reasoning: {
+      ...(stream === "text" || stream === "summary" ? { stream } : {}),
+      ...(contentIndex === undefined ? {} : { contentIndex }),
+      ...(summaryIndex === undefined ? {} : { summaryIndex }),
+    },
+  };
 }
 
 function modeFrom(value: unknown): AgentMode | undefined {
@@ -110,27 +282,28 @@ function timelineItemFrom(value: unknown): AgentTimelineItem | undefined {
   const input = record(value);
   if (input === undefined) return undefined;
   const type = fieldString(input, "type");
+  const metadata = metadataFrom(input["metadata"]);
   if (type === "user_message") {
     const text = fieldString(input, "text");
     if (text === undefined) return undefined;
     const messageId = fieldString(input, "messageId");
     const clientMessageId = fieldString(input, "clientMessageId");
-    return { type, text, ...(messageId === undefined ? {} : { messageId }), ...(clientMessageId === undefined ? {} : { clientMessageId }) };
+    return { type, text, ...(messageId === undefined ? {} : { messageId }), ...(clientMessageId === undefined ? {} : { clientMessageId }), ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "assistant_message") {
     const text = fieldString(input, "text");
     if (text === undefined) return undefined;
     const messageId = fieldString(input, "messageId");
     const partial = fieldBoolean(input, "partial");
-    return { type, text, ...(messageId === undefined ? {} : { messageId }), ...(partial === undefined ? {} : { partial }) };
+    return { type, text, ...(messageId === undefined ? {} : { messageId }), ...(partial === undefined ? {} : { partial }), ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "reasoning") {
     const text = fieldString(input, "text");
-    return text === undefined ? undefined : { type, text };
+    return text === undefined ? undefined : { type, text, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "error") {
     const message = fieldString(input, "message");
-    return message === undefined ? undefined : { type, message };
+    return message === undefined ? undefined : { type, message, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type !== "tool_call") return undefined;
   const id = fieldString(input, "id");
@@ -146,6 +319,44 @@ function timelineItemFrom(value: unknown): AgentTimelineItem | undefined {
     ...(Object.prototype.hasOwnProperty.call(input, "input") ? { input: input["input"] } : {}),
     ...(Object.prototype.hasOwnProperty.call(input, "output") ? { output: input["output"] } : {}),
     ...(error === undefined ? {} : { error }),
+    ...(metadata === undefined ? {} : { metadata }),
+  };
+}
+
+function identifierFrom(value: unknown): string | number | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+}
+
+function serverRequestFrom(value: unknown): AgentServerRequest | undefined {
+  const input = record(value);
+  if (input === undefined) return undefined;
+  const rawMethod = fieldString(input, "method") ?? fieldString(input, "requestType");
+  const directKind = fieldString(input, "kind");
+  const kind = directKind === "command_approval" || rawMethod === "item/commandExecution/requestApproval" || rawMethod === "command_approval"
+    ? "command_approval"
+    : directKind === "file_approval" || rawMethod === "item/fileChange/requestApproval" || rawMethod === "file_approval"
+      ? "file_approval"
+      : directKind === "permission" || rawMethod === "item/permissions/requestApproval" || rawMethod === "permission"
+        ? "permission"
+        : directKind === "user_input" || rawMethod === "item/tool/requestUserInput" || rawMethod === "user_input"
+          ? "user_input"
+          : directKind === "elicitation" || rawMethod === "mcpServer/elicitation/request" || rawMethod === "elicitation"
+            ? "elicitation"
+            : undefined;
+  if (kind === undefined) return undefined;
+  const params = record(input["params"]) ?? record(input["input"]);
+  const requestInput: Record<string, unknown> = {};
+  for (const key of ["command", "cwd", "paths", "reason", "availableDecisions", "questions", "context"]) {
+    if (params !== undefined && Object.prototype.hasOwnProperty.call(params, key)) requestInput[key] = params[key];
+  }
+  const toolName = fieldString(input, "toolName") ?? fieldString(params ?? {}, "toolName") ?? fieldString(params ?? {}, "name");
+  const id = identifierFrom(input["id"] ?? input["requestId"] ?? params?.["requestId"]);
+  return {
+    kind,
+    ...(id === undefined ? {} : { id }),
+    ...(toolName === undefined ? {} : { toolName }),
+    ...(Object.keys(requestInput).length === 0 ? {} : { input: requestInput as AgentMetadata }),
   };
 }
 
@@ -197,7 +408,26 @@ function providerSubagentFrom(value: unknown): ProviderSubagentEvent | undefined
   return { subagentId, status, ...(text === undefined ? {} : { text }), ...(item === undefined ? {} : { item }) };
 }
 
-/** Converts opaque CLI notifications and canonical events to AgentStreamEvent. */
+function mergeMetadata(...values: readonly (AgentEventMetadata | undefined)[]): AgentEventMetadata | undefined {
+  const merged = Object.assign({}, ...values.filter((value): value is AgentEventMetadata => value !== undefined));
+  return Object.keys(merged).length === 0 ? undefined : merged;
+}
+
+function errorMessageFrom(value: unknown, fallback: string): string {
+  return stringValue(value) ?? fieldString(record(value) ?? {}, "message") ?? fallback;
+}
+
+function errorMetadataFrom(
+  value: unknown,
+  fallbackMessage: string,
+  code?: string,
+  diagnostic?: string,
+): AgentEventMetadata | undefined {
+  const error = structuredErrorFrom(value, fallbackMessage, code, diagnostic);
+  return error === undefined ? undefined : { error };
+}
+
+/** Converts opaque external notifications and canonical events to AgentStreamEvent. */
 export function normalizeExternalEngineEvent(value: unknown, provider: AgentProvider, fallbackTurnId?: string): AgentStreamEvent | undefined {
   const input = record(value);
   if (input === undefined) return undefined;
@@ -215,90 +445,127 @@ export function normalizeExternalEngineEvent(value: unknown, provider: AgentProv
     const id = fieldString(input, "id");
     const name = fieldString(input, "name");
     if (id === undefined || name === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "timeline", provider, item: { type: "tool_call", id, name, status: "running", ...(input["arguments"] === undefined ? {} : { input: input["arguments"] }) } };
-    return withTurn(event, turnId);
+    const metadata = mergeMetadata(toolMetadataFrom(input), metadataFrom(input["metadata"]));
+    const item: AgentTimelineItem = {
+      type: "tool_call",
+      id,
+      name,
+      status: "running",
+      ...(input["arguments"] === undefined ? {} : { input: input["arguments"] }),
+      ...(metadata === undefined ? {} : { metadata }),
+    };
+    return withTurn({ type: "timeline", provider, item }, turnId);
   }
   if (type === "tool-result") {
     const id = fieldString(input, "id");
     if (id === undefined) return undefined;
     const output = input["output"];
     const failed = fieldBoolean(input, "isError") ?? false;
-    const event: AgentStreamEvent = {
-      type: "timeline",
-      provider,
-      item: {
-        type: "tool_call",
-        id,
-        name: fieldString(input, "name") ?? "external_tool",
-        status: failed ? "failed" : "completed",
-        ...(output === undefined ? {} : { output }),
-        ...(failed ? { error: typeof output === "string" ? output : "external tool failed" } : {}),
-      },
+    const error = failed ? errorMessageFrom(output, "external tool failed") : undefined;
+    const toolErrorMetadata = failed || input["errorDetails"] !== undefined || input["error"] !== undefined
+      ? errorMetadataFrom(input["errorDetails"] ?? input["error"] ?? output, error ?? "external tool failed")
+      : undefined;
+    const metadata = mergeMetadata(
+      toolMetadataFrom(input),
+      toolErrorMetadata,
+      metadataFrom(input["metadata"]),
+    );
+    const item: AgentTimelineItem = {
+      type: "tool_call",
+      id,
+      name: fieldString(input, "name") ?? "external_tool",
+      status: failed ? "failed" : "completed",
+      ...(output === undefined ? {} : { output }),
+      ...(error === undefined ? {} : { error }),
+      ...(metadata === undefined ? {} : { metadata }),
     };
-    return withTurn(event, turnId);
+    return withTurn({ type: "timeline", provider, item }, turnId);
   }
   if (type === "turn-completed") {
     const status = fieldString(input, "status");
+    const turn = record(input["turn"]);
+    const usageValue = input["usage"] ?? input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"];
+    const usage = usageFrom(usageValue, input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"]);
+    const failureMessage = errorMessageFrom(input["error"], "external engine turn failed");
+    const failureMetadata = errorMetadataFrom(input["errorDetails"] ?? input["error"], failureMessage);
     const event: AgentStreamEvent = status === "completed"
-      ? { type: "turn_completed", provider }
-      : { type: "turn_failed", provider, error: fieldString(input, "error") ?? "external engine turn failed" };
+      ? { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }) }
+      : { type: "turn_failed", provider, error: failureMessage, ...(failureMetadata === undefined ? {} : { metadata: failureMetadata }) };
     return withTurn(event, turnId);
   }
 
   if (type === "thread_started") {
     const sessionId = fieldString(input, "sessionId");
-    return sessionId === undefined ? undefined : { type: "thread_started", provider, sessionId };
+    const metadata = metadataFrom(input["metadata"]);
+    return sessionId === undefined ? undefined : { type: "thread_started", provider, sessionId, ...(metadata === undefined ? {} : { metadata }) };
   }
-  if (type === "turn_started") return withTurn({ type: "turn_started", provider }, turnId);
+  if (type === "turn_started") {
+    const metadata = metadataFrom(input["metadata"]);
+    return withTurn({ type: "turn_started", provider, ...(metadata === undefined ? {} : { metadata }) }, turnId);
+  }
   if (type === "turn_completed") {
-    const usage = usageFrom(input["usage"]);
-    const event: AgentStreamEvent = { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }) };
+    const turn = record(input["turn"]);
+    const usageValue = input["usage"] ?? input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"];
+    const usage = usageFrom(usageValue, input["tokenUsage"] ?? turn?.["usage"] ?? turn?.["tokenUsage"]);
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "turn_completed", provider, ...(usage === undefined ? {} : { usage }), ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "turn_failed") {
-    const error = fieldString(input, "error");
+    const errorValue = input["error"];
+    const error = errorValue === undefined ? undefined : errorMessageFrom(errorValue, "external engine turn failed");
     if (error === undefined) return undefined;
     const code = fieldString(input, "code");
     const diagnostic = fieldString(input, "diagnostic");
-    const event: AgentStreamEvent = { type: "turn_failed", provider, error, ...(code === undefined ? {} : { code }), ...(diagnostic === undefined ? {} : { diagnostic }) };
+    const metadata = mergeMetadata(
+      errorMetadataFrom(input["errorDetails"] ?? input["structuredError"] ?? input["error"], error, code, diagnostic),
+      metadataFrom(input["metadata"]),
+    );
+    const event: AgentStreamEvent = { type: "turn_failed", provider, error, ...(code === undefined ? {} : { code }), ...(diagnostic === undefined ? {} : { diagnostic }), ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "turn_canceled") {
     const reason = fieldString(input, "reason");
     if (reason === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "turn_canceled", provider, reason };
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "turn_canceled", provider, reason, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "timeline") {
     const item = timelineItemFrom(input["item"]);
     if (item === undefined) return undefined;
     const timestamp = fieldString(input, "timestamp");
-    const event: AgentStreamEvent = { type: "timeline", provider, item, ...(timestamp === undefined ? {} : { timestamp }) };
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "timeline", provider, item, ...(timestamp === undefined ? {} : { timestamp }), ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "reasoning") {
     const text = fieldString(input, "text");
     if (text === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "reasoning", provider, text };
+    const metadata = mergeMetadata(reasoningMetadataFrom(input), metadataFrom(input["metadata"]));
+    const event: AgentStreamEvent = { type: "reasoning", provider, text, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "usage_updated") {
-    const usage = usageFrom(input["usage"]);
+    const usage = usageFrom(input["usage"] ?? input["tokenUsage"], input["tokenUsage"]);
     if (usage === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "usage_updated", provider, usage };
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "usage_updated", provider, usage, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "permission_requested") {
     const request = permissionRequestFrom(input["request"]);
     if (request === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "permission_requested", provider, request };
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "permission_requested", provider, request, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "permission_resolved") {
     const requestId = fieldString(input, "requestId");
     const resolution = permissionResponseFrom(input["resolution"]);
     if (requestId === undefined || resolution === undefined) return undefined;
-    const event: AgentStreamEvent = { type: "permission_resolved", provider, requestId, resolution };
+    const metadata = metadataFrom(input["metadata"]);
+    const event: AgentStreamEvent = { type: "permission_resolved", provider, requestId, resolution, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   if (type === "mode_changed") {
@@ -306,33 +573,49 @@ export function normalizeExternalEngineEvent(value: unknown, provider: AgentProv
     const availableModes = Array.isArray(input["availableModes"])
       ? input["availableModes"].map(modeFrom).filter((mode): mode is AgentMode => mode !== undefined)
       : [];
-    return { type: "mode_changed", provider, currentModeId, availableModes };
+    const metadata = metadataFrom(input["metadata"]);
+    return { type: "mode_changed", provider, currentModeId, availableModes, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "model_changed") {
     const runtimeInfo = runtimeInfoFrom(input["runtimeInfo"], provider);
-    return runtimeInfo === undefined ? undefined : { type: "model_changed", provider, runtimeInfo };
+    const metadata = metadataFrom(input["metadata"]);
+    return runtimeInfo === undefined ? undefined : { type: "model_changed", provider, runtimeInfo, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "thinking_option_changed") {
     const thinkingOptionId = input["thinkingOptionId"] === null ? null : fieldString(input, "thinkingOptionId") ?? null;
-    return { type: "thinking_option_changed", provider, thinkingOptionId };
+    const metadata = metadataFrom(input["metadata"]);
+    return { type: "thinking_option_changed", provider, thinkingOptionId, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "attention_required") {
     const reason = fieldString(input, "reason");
     const timestamp = fieldString(input, "timestamp");
     if ((reason !== "finished" && reason !== "error" && reason !== "permission") || timestamp === undefined) return undefined;
-    return { type: "attention_required", provider, reason, timestamp };
+    const metadata = metadataFrom(input["metadata"]);
+    return { type: "attention_required", provider, reason, timestamp, ...(metadata === undefined ? {} : { metadata }) };
   }
   if (type === "provider_subagent") {
     const event = providerSubagentFrom(input["event"]);
     if (event === undefined) return undefined;
-    const canonical: AgentStreamEvent = { type: "provider_subagent", provider, event };
+    const metadata = metadataFrom(input["metadata"]);
+    const canonical: AgentStreamEvent = { type: "provider_subagent", provider, event, ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(canonical, turnId);
   }
+  if (type === "server_request" || type === "server-request") {
+    const request = serverRequestFrom(input["request"] ?? input);
+    if (request === undefined) return undefined;
+    const event: AgentStreamEvent = { type: "server_request", provider, request };
+    return withTurn(event, turnId);
+  }
   if (type === "error") {
-    const error = fieldString(input, "error");
+    const errorValue = input["error"];
+    const error = errorValue === undefined ? undefined : errorMessageFrom(errorValue, "external engine error");
     if (error === undefined) return undefined;
     const code = fieldString(input, "code");
-    const event: AgentStreamEvent = { type: "error", provider, error, ...(code === undefined ? {} : { code }) };
+    const metadata = mergeMetadata(
+      errorMetadataFrom(input["errorDetails"] ?? input["structuredError"] ?? input["error"], error, code),
+      metadataFrom(input["metadata"]),
+    );
+    const event: AgentStreamEvent = { type: "error", provider, error, ...(code === undefined ? {} : { code }), ...(metadata === undefined ? {} : { metadata }) };
     return withTurn(event, turnId);
   }
   return undefined;
@@ -381,6 +664,8 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   private readonly resolveProcessExited: () => void
   readonly process: { readonly exited: Promise<void>; readonly stderrTail: string }
   private readonly partialAssistantTurns = new Set<string>()
+  private readonly terminalTurns = new Set<string>()
+  private suppressUnscopedEvents = false
   private readonly listeners = new Set<ExternalEngineEventHandler>();
   private readonly unsubscribe: () => void;
   private activeTurnId: string | undefined;
@@ -394,14 +679,28 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
     this.resolveProcessExited = resolveProcessExited
     this.process = { exited: this.processExited, stderrTail: "" }
     this.unsubscribe = session.subscribe(event => {
+      const eventTurnId = "turnId" in event ? event.turnId : undefined;
       if (event.type === "turn_started") {
+        if (this.terminalTurns.has(event.turnId)) return;
         this.activeTurnId = event.turnId;
+        this.suppressUnscopedEvents = false;
         this.interruptTurnId = undefined;
         this.interruptPromise = undefined;
+      } else if (eventTurnId !== undefined && this.terminalTurns.has(eventTurnId)) {
+        return;
+      } else if (eventTurnId === undefined && this.suppressUnscopedEvents && event.type !== "process_exited") {
+        return;
       }
       if (event.type === "process_exited") this.resolveProcessExited()
       const projected = this.project(event);
-      if (projected !== undefined) for (const listener of [...this.listeners]) listener(projected);
+      if (projected !== undefined) {
+        if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_canceled") {
+          const terminalTurnId = event.turnId ?? this.activeTurnId;
+          if (terminalTurnId !== undefined) this.terminalTurns.add(terminalTurnId);
+          if (event.turnId === undefined) this.suppressUnscopedEvents = true;
+        }
+        for (const listener of [...this.listeners]) listener(projected);
+      }
       if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_canceled") {
         if (event.turnId === undefined || event.turnId === this.activeTurnId) {
           this.activeTurnId = undefined;
@@ -421,7 +720,7 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
 
   async startTurn(text: string, _signal?: AbortSignal): Promise<{ readonly id: string }> {
     const result = await this.session.startTurn(text);
-    this.activeTurnId = result.turnId;
+    this.activeTurnId = this.terminalTurns.has(result.turnId) ? undefined : result.turnId;
     this.interruptTurnId = undefined;
     this.interruptPromise = undefined;
     return { id: result.turnId };
@@ -459,7 +758,8 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
         if (event.item.type === "assistant_message" && event.item.partial !== true && event.turnId !== undefined && this.partialAssistantTurns.has(event.turnId)) {
           return undefined
         }
-        return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item: this.timeline(event.item) };
+        const item = this.timeline(event.item);
+        return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item };
       }
       case "usage_updated": return { type: "usage_updated", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), usage: toUsage(event.usage) };
       case "permission_requested": return { type: "permission_requested", provider, request: toPermission(event.request) };
@@ -470,7 +770,8 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
       }
       case "turn_failed": {
         if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
-        return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error };
+        const metadata: AgentEventMetadata = { error: { message: event.error } };
+        return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error, metadata };
       }
       case "turn_canceled": {
         if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
@@ -481,15 +782,21 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   }
 
   private timeline(item: ClaudeTimelineItem): AgentTimelineItem {
-    const value = item as { type: string; id?: string; text?: string; name?: string; arguments?: string; output?: string; isError?: boolean; partial?: boolean; metadata?: Record<string, unknown> };
+    const value = item as { type: string; id?: string; text?: string; name?: string; arguments?: string; output?: string; isError?: boolean; partial?: boolean; metadata?: AgentMetadata };
+    const metadata = metadataFrom(value.metadata);
     if (value.type === "tool_call" || value.type === "tool_result") {
       let input: unknown = value.arguments;
       if (typeof value.arguments === "string") { try { input = JSON.parse(value.arguments); } catch { input = value.arguments; } }
-      return { type: "tool_call", id: value.id ?? "", name: value.name ?? "external_tool", status: value.type === "tool_result" ? (value.isError ? "failed" : "completed") : "running", ...(input === undefined ? {} : { input }), ...(value.output === undefined ? {} : { output: value.output }) };
+      const toolMetadata = value.type === "tool_result" && value.isError === true
+        ? { error: { message: typeof value.output === "string" ? value.output : "external tool failed" } }
+        : undefined;
+      const combined = mergeMetadata(metadata, toolMetadata);
+      return { type: "tool_call", id: value.id ?? "", name: value.name ?? "external_tool", status: value.type === "tool_result" ? (value.isError ? "failed" : "completed") : "running", ...(input === undefined ? {} : { input }), ...(value.output === undefined ? {} : { output: value.output }), ...(combined === undefined ? {} : { metadata: combined }) };
     }
-    if (value.type === "reasoning") return { type: "reasoning", text: value.text ?? "" };
-    if (value.type === "compaction") return { type: "compaction", status: "completed" };
-    if (value.type === "status") return { type: "error", message: value.text ?? "" };
-    return { type: "assistant_message", text: value.text ?? "", ...(value.partial === undefined ? {} : { partial: value.partial }) };
+    if (value.type === "reasoning") return { type: "reasoning", text: value.text ?? "", ...(metadata === undefined ? {} : { metadata }) };
+    if (value.type === "compaction") return { type: "compaction", status: "completed", ...(metadata === undefined ? {} : { metadata }) };
+    if (value.type === "status") return { type: "error", message: value.text ?? "", ...(metadata === undefined ? {} : { metadata }) };
+    return { type: "assistant_message", text: value.text ?? "", ...(value.partial === undefined ? {} : { partial: value.partial }), ...(metadata === undefined ? {} : { metadata }) };
   }
+
 }

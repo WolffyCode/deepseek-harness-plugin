@@ -1,9 +1,10 @@
 import type { JsonRpcLineTransport } from "../codex/json-rpc.js";
-import type { AgentProvider, AgentStreamEvent } from "./provider-contract.js";
+import type { AgentEventMetadata, AgentProvider, AgentStreamEvent } from "./provider-contract.js";
 /** Opaque transport payload; the public stream vocabulary is AgentStreamEvent only. */
+export type ExternalEngineEventMetadata = AgentEventMetadata;
 export type ExternalEngineEvent = unknown;
 export type ExternalEngineEventHandler = (event: ExternalEngineEvent) => void;
-/** Converts opaque CLI notifications and canonical events to AgentStreamEvent. */
+/** Converts opaque external notifications and canonical events to AgentStreamEvent. */
 export declare function normalizeExternalEngineEvent(value: unknown, provider: AgentProvider, fallbackTurnId?: string): AgentStreamEvent | undefined;
 /** Runtime boundary used by the Harness bridge. */
 export interface ExternalEngineRuntime {
@@ -32,6 +33,8 @@ export declare class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime
         readonly stderrTail: string;
     };
     private readonly partialAssistantTurns;
+    private readonly terminalTurns;
+    private suppressUnscopedEvents;
     private readonly listeners;
     private readonly unsubscribe;
     private activeTurnId;
