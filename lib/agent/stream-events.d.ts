@@ -49,7 +49,7 @@ export interface RunProviderTurnOptions extends ProviderTurnRunner {
     readonly reduceFinalText?: ProviderFinalTextReducer;
 }
 /**
- * Runs one provider turn with the Helm/Paseo ordering contract:
+ * Runs one provider turn with the provider ordering contract:
  * subscribe first, start second, then bind and replay buffered events.
  *
  * Events without a turn id are accepted while the turn is live. An unscoped

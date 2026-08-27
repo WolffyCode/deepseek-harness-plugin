@@ -29,7 +29,7 @@ import {
   type ClaudeSessionHistoryOptions,
   type ListClaudeSessionsInput,
 } from './claude/persistence.js'
-import type { ClaudePersistenceHandle } from './claude/types.js'
+import type { ClaudeCatalogModel, ClaudePersistenceHandle } from './claude/types.js'
 import { ClaudeSessionRuntimeBridge } from './agent/runtime.js'
 import { EngineRegistry, ModelCatalog, ProviderRegistry } from './registry.js'
 import { resolveEngineProfile } from './profile/resolver.js'
@@ -82,6 +82,14 @@ export interface DiscoverCodexModelsOptions {
   readonly resumeThreadId?: string
 }
 
+export interface DiscoverClaudeModelsOptions {
+  readonly apiKey: string
+  readonly cwd: string
+  readonly executable?: string
+  readonly args?: readonly string[]
+  readonly catalogTtlMs?: number
+}
+
 export interface EngineSuite {
   readonly engines: EngineRegistry
   readonly providers: ProviderRegistry
@@ -90,6 +98,7 @@ export interface EngineSuite {
   readonly assets: EngineAssetRegistry
   resolveProfile(selection: EngineSelection): EngineProfileSnapshot
   discoverCodexModels(providerId: string, options: DiscoverCodexModelsOptions): Promise<readonly ModelRecord[]>
+  discoverClaudeModels(providerId: string, options: DiscoverClaudeModelsOptions): Promise<readonly ModelRecord[]>
 }
 
 /** Internal runtime face. It is intentionally not re-exported from the package root. */
@@ -136,7 +145,7 @@ export const CLAUDE_ENGINE: EngineDefinition = {
   capabilities: {
     streaming: true,
     sessionResume: true,
-    modelDiscovery: false,
+    modelDiscovery: true,
     reasoningDiscovery: true,
     approvals: true,
     mcp: true,
@@ -179,6 +188,32 @@ function claudeModelDescriptor(model: Pick<CreateModelInput, 'id' | 'modelId' | 
 
 function isClaudeOpusModel(model: Pick<CreateModelInput, 'engineId' | 'id' | 'modelId' | 'displayName'>): boolean {
   return model.engineId === 'claude-cli' && isOpusModel(claudeModelDescriptor(model))
+}
+
+function isClaudeGlmModel(model: ClaudeCatalogModel): boolean {
+  const text = [model.id, model.value, model.resolvedModel, model.label, model.description]
+    .filter((value): value is string => value !== undefined)
+    .join(' ')
+    .toLocaleLowerCase()
+  return text.includes('glm')
+}
+
+function toClaudeModelRecord(providerId: string, model: ClaudeCatalogModel): CreateModelInput | undefined {
+  const modelId = model.value ?? model.resolvedModel ?? model.id
+  if (!isClaudeGlmModel(model) || modelId.trim().length === 0) return undefined
+  const reasoningOptions = model.supportedEffortLevels?.map(id => ({ id }))
+  return {
+    id: `${providerId}/${modelId}`,
+    engineId: 'claude-cli',
+    providerId,
+    modelId,
+    ...(model.label === undefined ? {} : { displayName: model.label }),
+    ...(model.description === undefined ? {} : { description: model.description }),
+    ...(reasoningOptions === undefined ? {} : { reasoningOptions }),
+    ...(model.contextWindow === undefined ? {} : { contextWindowTokens: model.contextWindow }),
+    contextWindowSource: model.contextWindow === undefined ? 'unknown' : 'discovered',
+    source: 'discovered',
+  }
 }
 
 class ClaudePolicyModelCatalog extends ModelCatalog {
@@ -429,6 +464,38 @@ export function createEngineSuiteRuntime(options: CreateEngineSuiteRuntimeOption
       const discovered = await discoverCodexModels({ ...options, provider } satisfies CodexModelDiscoveryOptions)
       models.replaceProvider(providerId, discovered)
       return discovered
+    },
+    discoverClaudeModels: async (providerId, options) => {
+      const provider = providers.get(providerId)
+      if (provider.engineId !== 'claude-cli') throw new Error(`provider is not a Claude provider: ${provider.id}`)
+      if (options.apiKey.trim().length === 0) throw new Error('Claude API key must not be empty')
+      const session = claudeSessionFactory({
+        cwd: options.cwd,
+        baseUri: provider.baseUri,
+        authToken: options.apiKey,
+        persistSession: false,
+        ...(options.executable === undefined ? {} : { executablePath: options.executable }),
+        ...(options.args === undefined ? {} : { commandArgs: options.args }),
+        ...(options.catalogTtlMs === undefined ? {} : { catalogTtlMs: options.catalogTtlMs }),
+      })
+      try {
+        const catalog = await session.refreshCatalog()
+        const discovered = catalog.models
+          .map(model => toClaudeModelRecord(providerId, model))
+          .filter((model): model is CreateModelInput => model !== undefined)
+        models.replaceProvider(providerId, discovered.map(model => ({
+          ...model,
+          enabled: true,
+          hidden: false,
+          reasoningOptions: model.reasoningOptions ?? [],
+          inputModalities: model.inputModalities ?? ['text'],
+          contextWindowSource: model.contextWindowSource ?? 'unknown',
+          source: 'discovered' as const,
+        })))
+        return models.list(providerId)
+      } finally {
+        await session.close()
+      }
     },
     openCodex: async (selection, options) => {
       const profile = resolveProfile(selection)

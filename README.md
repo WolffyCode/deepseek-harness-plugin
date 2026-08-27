@@ -4,7 +4,7 @@
 
 ## 当前能力
 
-- `claude-cli`：Claude SDK stream-json，GLM model policy，文本/工具/权限/命令/历史/恢复；
+- `claude-cli`：Claude SDK stream-json，GLM model policy，模型发现、文本/工具/权限/命令/历史/恢复；
 - `codex-cli`：Codex app-server JSON-RPC，thread resume，model discovery，隔离 runtime；
 - Engine → Provider → Model → Reasoning 选择与 EngineProfile；
 - Session attach、空白 Session 引擎切换、native session/thread binding；
@@ -40,7 +40,7 @@ git diff --check
 
 真实 Claude E2E 要求配置的 Provider 同时提供 Anthropic Messages API 的 `GET /v1/models` 和 `POST /v1/messages`、认证环境变量、可执行的本地 `claude` CLI，以及 GLM model；不做 OpenAI 伪适配。Preflight 明确返回 `endpoint-mismatch`、`auth`、`network` 或 `protocol` 分类；只有缺少必需外部环境变量时真实 E2E 才显式 skip，Provider endpoint mismatch 不得 skip。
 
-2026-08-27 的真实 Provider 结果是 `GET /v1/models = 200`、`POST /v1/messages = 404`，因此分类为 `endpoint-mismatch`，真实 Claude E2E 按失败处理而不是 skip。只实现 `/v1/models` 或仅提供 OpenAI 路由不能通过 Claude CLI 验证。
+真实 Provider 的结果必须以本次运行的 preflight 为准；不能用历史响应或只通过 `GET /v1/models` 推断 Claude CLI 可用。只实现 `/v1/models` 或仅提供 OpenAI 路由不能通过 Claude CLI 验证。
 
 ```bash
 DSH_CLAUDE_REAL_BASE_URI=... \
@@ -60,4 +60,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-截至 2026-08-27，`npm run typecheck`、`npm test`、`pnpm test`、`npm run build`、`pnpm pack --dry-run` 和 `git diff --check` 均已通过；`npm test` 与 `pnpm test` 均为 **148 tests / 147 pass / 1 external skip**。该 skip 仅来自缺少必需的真实 Claude 外部环境变量。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **162 tests / 160 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。两个 skip 仅来自缺少必需的真实 Claude Provider 环境变量；带凭据的真实 Claude、MCP/Skill 和浏览器 E2E 必须单独执行，不能由这两个 skip 代替。

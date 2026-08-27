@@ -54,6 +54,13 @@ export interface DiscoverCodexModelsOptions {
     readonly preserveRuntimeRoot?: boolean;
     readonly resumeThreadId?: string;
 }
+export interface DiscoverClaudeModelsOptions {
+    readonly apiKey: string;
+    readonly cwd: string;
+    readonly executable?: string;
+    readonly args?: readonly string[];
+    readonly catalogTtlMs?: number;
+}
 export interface EngineSuite {
     readonly engines: EngineRegistry;
     readonly providers: ProviderRegistry;
@@ -62,6 +69,7 @@ export interface EngineSuite {
     readonly assets: EngineAssetRegistry;
     resolveProfile(selection: EngineSelection): EngineProfileSnapshot;
     discoverCodexModels(providerId: string, options: DiscoverCodexModelsOptions): Promise<readonly ModelRecord[]>;
+    discoverClaudeModels(providerId: string, options: DiscoverClaudeModelsOptions): Promise<readonly ModelRecord[]>;
 }
 /** Internal runtime face. It is intentionally not re-exported from the package root. */
 export interface ClaudeSessionConnectionOptions extends Omit<OpenEngineOptions, 'cwd' | 'resumeThreadId'> {

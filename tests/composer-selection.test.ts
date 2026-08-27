@@ -9,8 +9,8 @@ const catalog: EngineSuiteCatalogView = {
     { id: 'codex-cli', type: 'codex-cli', displayName: 'Codex CLI', capabilities: {} as never },
   ],
   providers: [
-    { id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (Paseo / OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'anthropic', authMode: 'auth-token', enabled: true, status: 'available' },
-    { id: 'codex-opencodebay', engineId: 'codex-cli', name: 'Codex (Paseo / OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'responses', authMode: 'api-key', enabled: true, status: 'available' },
+    { id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'anthropic', authMode: 'auth-token', enabled: true, status: 'available' },
+    { id: 'codex-opencodebay', engineId: 'codex-cli', name: 'Codex (OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'responses', authMode: 'api-key', enabled: true, status: 'available' },
   ],
   models: [
     { id: 'glm-opencodebay/glm-5.3', engineId: 'claude-cli', providerId: 'glm-opencodebay', modelId: 'glm-5.3', displayName: 'GLM 5.3', enabled: true, hidden: false, reasoningOptions: [{ id: 'low' }, { id: 'max' }], defaultReasoningEffort: 'max', inputModalities: ['text'], contextWindowTokens: 1_000_000, contextWindowSource: 'manual', source: 'manual' },

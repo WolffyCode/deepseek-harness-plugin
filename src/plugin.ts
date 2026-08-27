@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createEngineSuiteRuntime } from './engine-suite.js'
 import type { EngineSuite } from './engine-suite.js'
 import { EngineSuiteAgentService } from './agent/service.js'
-import { readDebugCodexProviderSeed, readDebugPaseoGlmProviderSeed } from './debug-provider.js'
+import { readDebugCodexProviderSeed, readDebugGlmProviderSeed } from './debug-provider.js'
 import { registerEngineSuiteSettings, syncEngineSuiteSettings, type EngineSuiteSettings } from './settings.js'
 import { EngineSuiteGateway } from './remote.js'
 import { ExternalEngineLlmRouteRegistration } from './llm-route.js'
@@ -49,7 +49,7 @@ function overlayDebugSettings(
 }
 
 function debugBaseSettings(
-  glmSeed: ReturnType<typeof readDebugPaseoGlmProviderSeed>,
+  glmSeed: ReturnType<typeof readDebugGlmProviderSeed>,
   codexSeed: ReturnType<typeof readDebugCodexProviderSeed>,
 ): EngineSuiteSettings | undefined {
   const providers = [
@@ -95,7 +95,7 @@ function debugBaseSettings(
 export function apply(ctx: Context, config: EngineSuitePluginConfig = {}): void {
   const suite = createEngineSuiteRuntime()
   const debugSeed = readDebugCodexProviderSeed(process.env)
-  const glmSeed = readDebugPaseoGlmProviderSeed(process.env)
+  const glmSeed = readDebugGlmProviderSeed(process.env)
   if (glmSeed !== undefined) suite.providers.register(glmSeed.provider)
   if (debugSeed !== undefined) suite.providers.register(debugSeed.provider)
   const catalogReady = deferred()

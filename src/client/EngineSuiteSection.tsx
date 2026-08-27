@@ -98,7 +98,7 @@ export function EngineSuiteSection({ scope, catalog: controller }: EngineSuiteSe
   const mcpSets = snapshot.value?.mcpSets ?? []
   const [engineId, setEngineId] = useState('claude-cli')
   const [providerId, setProviderId] = useState('glm-opencodebay')
-  const [providerName, setProviderName] = useState('GLM (Paseo / OpenCodeBay)')
+  const [providerName, setProviderName] = useState('GLM (OpenCodeBay)')
   const [baseUri, setBaseUri] = useState('https://sub2api.opencodebay.com')
   const [credentialRef, setCredentialRef] = useState('ANTHROPIC_AUTH_TOKEN')
   const [modelRecordId, setModelRecordId] = useState('glm-opencodebay/glm-5.3')

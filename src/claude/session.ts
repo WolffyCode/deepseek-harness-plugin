@@ -20,6 +20,7 @@ import type {
   ClaudeAgentSession,
   ClaudeCatalog,
   ClaudeCatalogModel,
+  ClaudeEffortLevel,
   ClaudeInputMessage,
   ClaudeMcpStatus,
   ClaudeMode,
@@ -1163,8 +1164,15 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   private mapCatalogModel(value: CatalogModel): ClaudeCatalogModel {
     return {
       id: value.value,
+      value: value.value,
+      ...(value.resolvedModel === undefined ? {} : { resolvedModel: value.resolvedModel }),
       label: value.displayName,
       description: value.description,
+      ...(value.supportsEffort === undefined ? {} : { supportsEffort: value.supportsEffort }),
+      ...(value.supportedEffortLevels === undefined ? {} : { supportedEffortLevels: [...value.supportedEffortLevels] }),
+      ...(value.supportsAdaptiveThinking === undefined ? {} : { supportsAdaptiveThinking: value.supportsAdaptiveThinking }),
+      ...(value.supportsFastMode === undefined ? {} : { supportsFastMode: value.supportsFastMode }),
+      ...(value.supportsAutoMode === undefined ? {} : { supportsAutoMode: value.supportsAutoMode }),
     }
   }
 
@@ -1174,7 +1182,28 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
   }
   private mapModel(value: unknown): ClaudeCatalogModel {
     const item = asRecord(value) ?? {}
-    return { id: stringValue(item['id']) ?? stringValue(item['name']) ?? String(value), ...(stringValue(item['displayName']) === undefined ? {} : { label: String(item['displayName']) }), ...(stringValue(item['description']) === undefined ? {} : { description: String(item['description']) }), ...(numberValue(item['contextWindow']) === undefined ? {} : { contextWindow: Number(item['contextWindow']) }) }
+    const wireValue = stringValue(item['value'])
+    const explicitId = stringValue(item['id'])
+    const fallbackId = stringValue(item['name']) ?? String(value)
+    const modelId = explicitId ?? wireValue ?? fallbackId
+    const supportedEffortLevels = Array.isArray(item['supportedEffortLevels']) && item['supportedEffortLevels'].every(level =>
+      level === 'low' || level === 'medium' || level === 'high' || level === 'xhigh' || level === 'max',
+    )
+      ? item['supportedEffortLevels'] as ClaudeEffortLevel[]
+      : undefined
+    return {
+      id: modelId,
+      ...(wireValue === undefined ? {} : { value: wireValue }),
+      ...(stringValue(item['resolvedModel']) === undefined ? {} : { resolvedModel: String(item['resolvedModel']) }),
+      ...(stringValue(item['displayName']) === undefined ? {} : { label: String(item['displayName']) }),
+      ...(stringValue(item['description']) === undefined ? {} : { description: String(item['description']) }),
+      ...(numberValue(item['contextWindow']) === undefined ? {} : { contextWindow: Number(item['contextWindow']) }),
+      ...(typeof item['supportsEffort'] === 'boolean' ? { supportsEffort: item['supportsEffort'] } : {}),
+      ...(supportedEffortLevels === undefined ? {} : { supportedEffortLevels }),
+      ...(typeof item['supportsAdaptiveThinking'] === 'boolean' ? { supportsAdaptiveThinking: item['supportsAdaptiveThinking'] } : {}),
+      ...(typeof item['supportsFastMode'] === 'boolean' ? { supportsFastMode: item['supportsFastMode'] } : {}),
+      ...(typeof item['supportsAutoMode'] === 'boolean' ? { supportsAutoMode: item['supportsAutoMode'] } : {}),
+    }
   }
   private mapMcp(value: unknown): ClaudeMcpStatus {
     const item = asRecord(value) ?? {}

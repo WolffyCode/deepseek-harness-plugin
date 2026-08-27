@@ -26,8 +26,8 @@ export function readDebugCodexProviderSeed(
   }
 }
 
-/** Debug seed for the Paseo GLM provider; the token is read only from the environment. */
-export function readDebugPaseoGlmProviderSeed(
+/** Debug seed for the GLM provider; the token is read only from the environment. */
+export function readDebugGlmProviderSeed(
   env: Record<string, string | undefined>,
 ): DebugClaudeProviderSeed | undefined {
   const baseUri = env['DSH_DEBUG_GLM_BASE_URI']?.trim() ?? env['ANTHROPIC_BASE_URL']?.trim()
@@ -35,7 +35,7 @@ export function readDebugPaseoGlmProviderSeed(
   if (baseUri === undefined || apiKey === undefined || baseUri.length === 0 || apiKey.length === 0) return undefined
   return {
     provider: {
-      id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (Paseo / OpenCodeBay)',
+      id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (OpenCodeBay)',
       baseUri: normalizeBaseUri(baseUri), credentialRef: 'ANTHROPIC_AUTH_TOKEN',
       wireApi: 'anthropic', authMode: 'auth-token',
     },

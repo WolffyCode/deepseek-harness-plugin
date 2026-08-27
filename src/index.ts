@@ -1,5 +1,11 @@
-export { createEngineSuite, CODEX_ENGINE } from './engine-suite.js'
-export type { EngineSuite, OpenEngineOptions, OpenCodexOptions, DiscoverCodexModelsOptions } from './engine-suite.js'
+export { createEngineSuite, CODEX_ENGINE, CLAUDE_ENGINE } from './engine-suite.js'
+export type {
+  EngineSuite,
+  OpenEngineOptions,
+  OpenCodexOptions,
+  DiscoverCodexModelsOptions,
+  DiscoverClaudeModelsOptions,
+} from './engine-suite.js'
 
 export * from './debug-provider.js'
 export * from './engine/types.js'

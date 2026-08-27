@@ -250,7 +250,12 @@ export class EngineSuiteGateway extends Service {
           apiKey: await resolveApiKey(this.ctx, provider.credentialRef),
           cwd: process.cwd(),
         })
-      : this.engineSuite.models.list(providerId)
+      : provider.engineId === 'claude-cli'
+        ? await this.engineSuite.discoverClaudeModels(providerId, {
+            apiKey: await resolveApiKey(this.ctx, provider.credentialRef),
+            cwd: process.cwd(),
+          })
+        : this.engineSuite.models.list(providerId)
     return {
       models: models.map(model => ({
         id: model.id,

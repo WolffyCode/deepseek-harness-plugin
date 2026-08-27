@@ -73,11 +73,19 @@ export interface ClaudeUsage {
     readonly contextWindowMaxTokens?: number | undefined;
     readonly contextWindowUsedTokens?: number | undefined;
 }
+export type ClaudeEffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface ClaudeCatalogModel {
     readonly id: string;
+    readonly value?: string | undefined;
+    readonly resolvedModel?: string | undefined;
     readonly label?: string | undefined;
     readonly description?: string | undefined;
     readonly contextWindow?: number;
+    readonly supportsEffort?: boolean | undefined;
+    readonly supportedEffortLevels?: readonly ClaudeEffortLevel[] | undefined;
+    readonly supportsAdaptiveThinking?: boolean | undefined;
+    readonly supportsFastMode?: boolean | undefined;
+    readonly supportsAutoMode?: boolean | undefined;
 }
 export interface ClaudeSlashCommand {
     readonly name: string;

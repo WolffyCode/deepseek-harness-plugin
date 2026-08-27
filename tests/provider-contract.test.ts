@@ -227,7 +227,7 @@ test("opaque legacy runtime notifications normalize into AgentStreamEvent", () =
   });
 });
 
-test("the public event union follows the Helm/Paseo categories", () => {
+test("the public event union follows the provider event categories", () => {
   const events: AgentStreamEvent[] = [
     { type: "thread_started", provider: "fake", sessionId: "s" },
     { type: "turn_started", provider: "fake", turnId: "t" },

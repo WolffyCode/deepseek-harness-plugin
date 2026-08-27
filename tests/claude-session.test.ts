@@ -84,6 +84,50 @@ test('ClaudeProviderSession maps streaming timeline, reasoning, tools, usage and
   await session.close()
 })
 
+test('ClaudeProviderSession preserves SDK model identity and effort metadata from initialization', async () => {
+  let query!: FakeQuery
+  const session = createClaudeProviderSession({
+    cwd: process.cwd(),
+    model: 'glm-5.3',
+    queryFactory: ({ options }) => {
+      query = new FakeQuery(options)
+      return query as unknown as Query
+    },
+  })
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
+  const resultPromise = session.run('catalog')
+  query.push({
+    type: 'system',
+    subtype: 'init',
+    session_id: nativeSessionId,
+    model: 'glm-5.3',
+    models: [{
+      value: 'glm-5.3',
+      resolvedModel: 'glm-5.3',
+      displayName: 'GLM 5.3',
+      description: 'GLM model',
+      contextWindow: 1_000_000,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high', 'max'],
+    }],
+  } as unknown as SDKMessage)
+  query.push({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: nativeSessionId } as unknown as SDKMessage)
+  await resultPromise
+
+  assert.deepEqual(session.catalog.models, [{
+    id: 'glm-5.3',
+    value: 'glm-5.3',
+    resolvedModel: 'glm-5.3',
+    label: 'GLM 5.3',
+    description: 'GLM model',
+    contextWindow: 1_000_000,
+    supportsEffort: true,
+    supportedEffortLevels: ['low', 'medium', 'high', 'max'],
+  }])
+  await session.close()
+})
+
 test('ClaudeProviderSession maps MCP result block variants and nested content', async () => {
   let query!: FakeQuery
   const session = createClaudeProviderSession({

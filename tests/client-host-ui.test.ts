@@ -11,8 +11,8 @@ const catalog: EngineSuiteCatalogView = {
     { id: 'codex-cli', type: 'codex-cli', displayName: 'Codex CLI', capabilities: {} as never },
   ],
   providers: [
-    { id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (Paseo / OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'anthropic', authMode: 'auth-token', enabled: true, status: 'available' },
-    { id: 'codex-opencodebay', engineId: 'codex-cli', name: 'Codex (Paseo / OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'responses', authMode: 'api-key', enabled: true, status: 'available' },
+    { id: 'glm-opencodebay', engineId: 'claude-cli', name: 'GLM (OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'anthropic', authMode: 'auth-token', enabled: true, status: 'available' },
+    { id: 'codex-opencodebay', engineId: 'codex-cli', name: 'Codex (OpenCodeBay)', baseUri: 'https://sub2api.opencodebay.com', wireApi: 'responses', authMode: 'api-key', enabled: true, status: 'available' },
   ],
   models: [
     { id: 'glm-opencodebay/glm-5.3', engineId: 'claude-cli', providerId: 'glm-opencodebay', modelId: 'glm-5.3', displayName: 'GLM 5.3', enabled: true, hidden: false, reasoningOptions: [{ id: 'low' }, { id: 'max' }], defaultReasoningEffort: 'max', inputModalities: ['text'], contextWindowSource: 'manual', source: 'manual' },
@@ -38,7 +38,7 @@ test('Host catalog drives Claude + GLM and Codex choices while hiding Opus', asy
   }
   const controller = createEngineSuiteCatalogController(remote)
   const actual = await controller.refresh()
-  assert.deepEqual(enabledProviders(actual, 'claude-cli').map(provider => provider.name), ['GLM (Paseo / OpenCodeBay)'])
+  assert.deepEqual(enabledProviders(actual, 'claude-cli').map(provider => provider.name), ['GLM (OpenCodeBay)'])
   assert.deepEqual(enabledModels(actual, 'glm-opencodebay').map(model => model.displayName), ['GLM 5.3'])
   assert.deepEqual(filterModelOptions(enabledModels(actual, 'glm-opencodebay'), 'opus'), [])
   assert.deepEqual(resolveEngineSelection(actual, 'claude-cli'), {
