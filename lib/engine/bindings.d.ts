@@ -5,6 +5,9 @@ export interface ExternalEngineBinding {
     readonly nativeSessionId: string;
     readonly runtimeRoot: string;
     readonly selection: EngineSelection;
+    /** Host-owned executable configuration; credentials must never be supplied here. */
+    readonly executable?: string;
+    readonly args?: readonly string[];
 }
 /** Durable, secret-free mapping from Harness Session to a native Engine Session and runtime root. */
 export declare class ExternalEngineBindingStore {

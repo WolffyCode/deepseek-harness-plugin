@@ -14,6 +14,7 @@ export interface CreateExternalAgentOptions {
     readonly cwd: string;
     readonly executable?: string;
     readonly args?: readonly string[];
+    readonly startupTimeoutMs?: number;
 }
 export interface DelegateExternalAgentOptions {
     readonly profileId: EngineProfileId;
@@ -23,6 +24,7 @@ export interface DelegateExternalAgentOptions {
     /** Test/deployment executable override; the MCP bridge never carries this field. */
     readonly executable?: string;
     readonly args?: readonly string[];
+    readonly startupTimeoutMs?: number;
     readonly nativeTaskId?: string;
 }
 export interface EngineSuiteAgentHandle extends AgentHandle {
@@ -52,7 +54,6 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     private readonly childBridgeReady;
     private readonly lineageStore;
     private readonly closedSessions;
-    private readonly closedProcessOptions;
     constructor(ctx: Context, suite: EngineSuiteRuntime, resolveApiKey: (credentialRef: string) => string | Promise<string>, catalogReady?: Promise<void>, bindings?: ExternalEngineBindingStore, lineageStore?: ParentChildLineageStore);
     createExternal(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;
     createCodex(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;

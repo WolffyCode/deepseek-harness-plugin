@@ -51,6 +51,7 @@ export interface OpenEngineOptions {
   readonly executable?: string
   readonly args?: readonly string[]
   readonly disposeGraceMs?: number
+  readonly startupTimeoutMs?: number
   readonly runtimeRoot?: string
   readonly preserveRuntimeRoot?: boolean
   readonly resumeThreadId?: string
@@ -77,6 +78,7 @@ export interface DiscoverCodexModelsOptions {
   readonly executable?: string
   readonly args?: readonly string[]
   readonly disposeGraceMs?: number
+  readonly startupTimeoutMs?: number
   readonly runtimeRoot?: string
   readonly preserveRuntimeRoot?: boolean
   readonly resumeThreadId?: string
@@ -300,6 +302,11 @@ function mergeMcpSets(userSet: EngineMcpSet | undefined, internalSet: EngineMcpS
   return { id: userSet?.id ?? internalSet?.id ?? 'engine-suite-runtime', servers }
 }
 
+function codexMcpSet(userSet: EngineMcpSet | undefined, internalSet: EngineMcpSet | undefined): EngineMcpSet | undefined {
+  if (internalSet !== undefined) materializeInternalMcpServers(internalSet)
+  return mergeMcpSets(userSet, internalSet)
+}
+
 function materializeInternalMcpServers(input: EngineMcpSet | undefined): Readonly<Record<string, ClaudeSdkMcpServerConfig>> {
   if (input === undefined) return {}
   const result: Record<string, ClaudeSdkMcpServerConfig> = {}
@@ -499,15 +506,29 @@ export function createEngineSuiteRuntime(options: CreateEngineSuiteRuntimeOption
     },
     openCodex: async (selection, options) => {
       const profile = resolveProfile(selection)
+      const provider = providers.get(profile.providerId)
+      const model = models.get(profile.modelRecordId)
       const mcpSet = options.mcpSet ?? (profile.mcpSetRef === undefined ? undefined : assets.mcpSet(profile.mcpSetRef))
       const skillSet = options.skillSet ?? (profile.skillSetRef === undefined ? undefined : assets.skillSet(profile.skillSetRef))
+      const codexAssets = codexMcpSet(mcpSet, options.internalMcpSet)
+      const credentialResolverForLaunch = options.credentialResolver ?? credentialResolver
+      const {
+        mcpSet: _mcpSet,
+        skillSet: _skillSet,
+        internalMcpSet: _internalMcpSet,
+        credentialResolver: _credentialResolver,
+        sessionStore: _sessionStore,
+        sessionStoreFlush: _sessionStoreFlush,
+        ...codexOptions
+      } = options
       return openCodexLaunch({
-        ...options,
+        ...codexOptions,
         profile,
-        provider: providers.get(profile.providerId),
-        model: models.get(profile.modelRecordId),
-        ...mcpSet === undefined ? {} : { mcpSet },
+        provider,
+        model,
+        ...codexAssets === undefined ? {} : { mcpSet: codexAssets },
         ...skillSet === undefined ? {} : { skillSet },
+        ...credentialResolverForLaunch === undefined ? {} : { credentialResolver: credentialResolverForLaunch },
       } satisfies CodexLaunchOptions)
     },
     openEngine: async (selection, options) => {
@@ -517,14 +538,25 @@ export function createEngineSuiteRuntime(options: CreateEngineSuiteRuntimeOption
       const mcpSet = options.mcpSet ?? (profile.mcpSetRef === undefined ? undefined : assets.mcpSet(profile.mcpSetRef))
       const skillSet = options.skillSet ?? (profile.skillSetRef === undefined ? undefined : assets.skillSet(profile.skillSetRef))
       if (profile.engineId === 'codex-cli') {
-        const { mcpSet: _mcpSet, skillSet: _skillSet, ...codexOptions } = options
+        const codexAssets = codexMcpSet(mcpSet, options.internalMcpSet)
+        const credentialResolverForLaunch = options.credentialResolver ?? credentialResolver
+        const {
+          mcpSet: _mcpSet,
+          skillSet: _skillSet,
+          internalMcpSet: _internalMcpSet,
+          credentialResolver: _credentialResolver,
+          sessionStore: _sessionStore,
+          sessionStoreFlush: _sessionStoreFlush,
+          ...codexOptions
+        } = options
         const launch = await openCodexLaunch({
           ...codexOptions,
           profile,
           provider,
           model,
-          ...mcpSet === undefined ? {} : { mcpSet },
+          ...codexAssets === undefined ? {} : { mcpSet: codexAssets },
           ...skillSet === undefined ? {} : { skillSet },
+          ...credentialResolverForLaunch === undefined ? {} : { credentialResolver: credentialResolverForLaunch },
         } satisfies CodexLaunchOptions)
         return {
           runtime: launch.runtime,

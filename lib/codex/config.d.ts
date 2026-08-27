@@ -12,7 +12,9 @@ export interface CodexConfigMaterialization {
     readonly environment: Readonly<Record<string, string>>;
     readonly redactions: readonly string[];
 }
-/** Render the minimal Codex provider config without embedding an API key. */
+export type CodexCredentialResolver = (credentialRef: string) => string | undefined | Promise<string | undefined>;
+/** Resolve MCP credentials into the child environment; config.toml only carries env names. */
+export declare function resolveCodexMcpEnvironment(mcpSet: EngineMcpSet | undefined, resolver: CodexCredentialResolver): Promise<Readonly<Record<string, string>>>;
 export interface CodexProviderConfigMaterialization {
     readonly configToml: string;
     readonly modelProvider: string;

@@ -55,7 +55,7 @@ pnpm test
 git diff --check
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **162 tests / 160 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` **通过**。构建后 `lib/types/client/index.d.ts` 等 client declaration artifacts 与 package exports 一致。两个 skip 仅表示缺少真实 Claude Provider 环境，不能当作真实 E2E 通过。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` **通过**。构建后 `lib/types/client/index.d.ts` 等 client declaration artifacts 与 package exports 一致。两个 skip 仅表示缺少真实 Claude Provider 环境，不能当作真实 E2E 通过。
 
 真实 Claude E2E 不属于无凭据单测：`tests/claude-real.e2e.test.ts` 要求 Anthropic Messages API 的 `GET /v1/models` 与 `POST /v1/messages`、认证环境变量、可执行的本地 `claude` CLI，以及 GLM model。preflight 将失败明确分类为 `endpoint-mismatch`、`auth`、`network` 或 `protocol`；这些 Provider 失败都必须让真实 E2E 失败，只有缺少必需外部环境变量时才显式 skip。它不能被改成静默通过，也不能用 fake query 或 OpenAI 伪适配代替真实 E2E。
 

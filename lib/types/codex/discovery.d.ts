@@ -7,6 +7,7 @@ export interface CodexModelDiscoveryOptions {
     readonly executable?: string;
     readonly args?: readonly string[];
     readonly disposeGraceMs?: number;
+    readonly startupTimeoutMs?: number;
 }
 export declare function discoverCodexModels(options: CodexModelDiscoveryOptions): Promise<readonly ModelRecord[]>;
 //# sourceMappingURL=discovery.d.ts.map

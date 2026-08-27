@@ -3,6 +3,8 @@ import type { ExternalEngineEvent, ExternalEngineEventHandler } from '../agent/r
 import { JsonRpcLineTransport as LineTransport } from './json-rpc.js'
 import { CodexProcess, type CodexProcessOptions, type ProcessExit } from './process.js'
 
+const DEFAULT_STARTUP_TIMEOUT_MS = 30_000
+
 export interface CodexRuntimeOptions extends CodexProcessOptions {
   readonly modelProvider?: string
   readonly model?: string
@@ -12,6 +14,8 @@ export interface CodexRuntimeOptions extends CodexProcessOptions {
   readonly approvalPolicy?: JsonValue
   readonly sandbox?: JsonValue
   readonly serverRequestHandler?: JsonRpcRequestHandler
+  /** Upper bound for the initialize handshake; the timer is cleared on success and failure. */
+  readonly startupTimeoutMs?: number
 }
 
 export interface CodexThread {
@@ -55,45 +59,136 @@ function stringField(value: JsonValue | undefined): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+function numberField(value: JsonValue | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function recordField(value: JsonValue | undefined): JsonObject | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as JsonObject : undefined
+}
+
 function serialized(value: JsonValue | undefined): string {
   if (typeof value === 'string') return value
   if (value === undefined) return ''
-  return JSON.stringify(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return ''
+  }
 }
 
-function toolCallFromItem(item: JsonObject): { readonly id: string; readonly name: string; readonly arguments: string } | undefined {
-  const id = stringField(item['id'])
+type TurnStatus = 'completed' | 'interrupted' | 'failed' | 'inProgress'
+
+function turnStatus(value: JsonValue | undefined): TurnStatus | undefined {
+  const status = stringField(value)
+  if (status === 'completed') return 'completed'
+  if (status === 'interrupted' || status === 'canceled' || status === 'cancelled') return 'interrupted'
+  if (status === 'failed' || status === 'error') return 'failed'
+  if (status === 'inProgress' || status === 'in_progress' || status === 'running') return 'inProgress'
+  return undefined
+}
+
+function startupTimeoutMs(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_STARTUP_TIMEOUT_MS
+  if (!Number.isFinite(timeout) || timeout <= 0) throw new Error('Codex startup timeout must be a finite positive number')
+  return timeout
+}
+
+function safeErrorMessage(error: JsonValue | undefined, fallback = 'Codex turn failed'): string {
+  if (typeof error === 'string' && error.length > 0) return error
+  const details = recordField(error)
+  const message = stringField(details?.['message'])
+  return message ?? (serialized(error) || fallback)
+}
+
+function canonicalUsage(tokenUsage: JsonObject): JsonObject {
+  const total = recordField(tokenUsage['total'])
+  const last = recordField(tokenUsage['last'])
+  const usage: Record<string, JsonValue> = {}
+  for (const [v2Key, canonicalKey] of [
+    ['inputTokens', 'inputTokens'],
+    ['cachedInputTokens', 'cachedInputTokens'],
+    ['outputTokens', 'outputTokens'],
+  ] as const) {
+    const value = numberField(total?.[v2Key]) ?? numberField(last?.[v2Key])
+    if (value !== undefined) usage[canonicalKey] = value
+  }
+  const contextWindow = numberField(tokenUsage['modelContextWindow'])
+  if (contextWindow !== undefined) usage['contextWindowMaxTokens'] = contextWindow
+  return usage as JsonObject
+}
+
+function itemStatus(value: JsonValue | undefined): string | undefined {
+  return stringField(value)
+}
+
+function itemType(item: JsonObject): string | undefined {
+  return stringField(item['type'])
+}
+
+function itemId(item: JsonObject, params?: JsonObject): string | undefined {
+  return stringField(item['id']) ?? stringField(params?.['itemId'])
+}
+
+function itemError(item: JsonObject): JsonValue | undefined {
+  const error = item['error']
+  if (error !== undefined && error !== null) return error
+  return item['isError'] === true ? item['output'] ?? item['result'] : undefined
+}
+
+function toolCallFromItem(item: JsonObject, params?: JsonObject): { readonly id: string; readonly name: string; readonly arguments: string; readonly itemType: string; readonly item: JsonObject } | undefined {
+  const id = itemId(item, params)
   if (id === undefined) return undefined
-  const type = stringField(item['type'])
+  const type = itemType(item)
   if (type === 'commandExecution') {
-    return { id, name: 'command_execution', arguments: JSON.stringify({ command: item['command'] ?? '' }) }
+    return { id, name: 'command_execution', arguments: JSON.stringify({ command: item['command'] ?? '', ...item['cwd'] === undefined ? {} : { cwd: item['cwd'] } }), itemType: type, item }
   }
   if (type === 'fileChange') {
-    return { id, name: 'file_change', arguments: JSON.stringify({ changes: item['changes'] ?? item['patch'] ?? [] }) }
+    return { id, name: 'file_change', arguments: JSON.stringify({ changes: item['changes'] ?? item['patch'] ?? [] }), itemType: type, item }
   }
   if (type === 'mcpToolCall') {
     return {
       id,
       name: stringField(item['tool']) ?? 'mcp_tool',
       arguments: serialized(item['arguments'] ?? item['input'] ?? {}),
+      itemType: type,
+      item,
+    }
+  }
+  if (type === 'dynamicToolCall') {
+    return {
+      id,
+      name: stringField(item['name']) ?? stringField(item['tool']) ?? 'dynamic_tool',
+      arguments: serialized(item['arguments'] ?? item['input'] ?? {}),
+      itemType: type,
+      item,
     }
   }
   if (type === 'webSearch') {
-    return { id, name: 'web_search', arguments: serialized(item['query'] ?? item['input'] ?? {}) }
+    return { id, name: 'web_search', arguments: serialized(item['query'] ?? item['input'] ?? {}), itemType: type, item }
   }
   if (type === 'computerCall' || type === 'computer_call') {
-    return { id, name: 'computer', arguments: serialized(item['action'] ?? item['input'] ?? item) }
+    return { id, name: 'computer', arguments: serialized(item['action'] ?? item['input'] ?? item), itemType: type, item }
   }
   return undefined
 }
 
-function toolResultFromItem(item: JsonObject): { readonly id: string; readonly output: string; readonly isError: boolean } | undefined {
-  const id = stringField(item['id'])
+function toolResultFromItem(item: JsonObject, params?: JsonObject): { readonly id: string; readonly output: string; readonly isError: boolean; readonly status?: string; readonly error?: string; readonly errorDetails?: JsonValue; readonly itemType: string; readonly item: JsonObject } | undefined {
+  const id = itemId(item, params)
   if (id === undefined) return undefined
-  const status = stringField(item['status'])
-  const isError = status === 'failed' || status === 'declined' || status === 'error' || item['isError'] === true
+  const status = itemStatus(item['status'])
+  const error = itemError(item)
+  const isError = status === 'failed' || status === 'declined' || status === 'error' || status === 'canceled' || status === 'cancelled' || error !== undefined
   const output = item['aggregatedOutput'] ?? item['output'] ?? item['stdout'] ?? item['stderr'] ?? item['result'] ?? item['changes'] ?? item['patch']
-  return { id, output: serialized(output ?? item), isError }
+  return {
+    id,
+    output: serialized(output ?? itemError(item) ?? item),
+    isError,
+    ...status === undefined ? {} : { status },
+    ...error === undefined ? {} : { error: safeErrorMessage(error, 'Codex tool failed'), errorDetails: error },
+    itemType: itemType(item) ?? 'unknown',
+    item,
+  }
 }
 
 function defaultServerRequestHandler(method: string): JsonValue {
@@ -119,6 +214,8 @@ export class CodexRuntime {
   private thread: CodexThread | undefined
   private turn: CodexTurn | undefined
   private closed = false
+  private closePromise: Promise<ProcessExit> | undefined
+  private readonly turnStatuses = new Map<string, TurnStatus>()
   private readonly eventListeners = new Set<ExternalEngineEventHandler>()
 
   private constructor(
@@ -133,17 +230,32 @@ export class CodexRuntime {
   }
 
   static async open(options: CodexRuntimeOptions): Promise<CodexRuntime> {
+    const timeoutMs = startupTimeoutMs(options.startupTimeoutMs)
     const process = CodexProcess.start(options)
     const transport = new LineTransport(process.child.stdout, process.child.stdin)
     transport.start()
     const runtime = new CodexRuntime(process, transport, options)
+    const startupAbort = new AbortController()
+    const startupTimer = setTimeout(() => {
+      startupAbort.abort(new Error(`Codex startup timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    startupTimer.unref?.()
     try {
-      await runtime.initialize()
+      await runtime.initialize(startupAbort.signal)
       return runtime
     } catch (error: unknown) {
-      transport.close(error instanceof Error ? error : new Error(String(error)))
-      await process.dispose()
-      throw error
+      const failure = startupAbort.signal.reason instanceof Error
+        ? startupAbort.signal.reason
+        : error instanceof Error ? error : new Error(String(error))
+      transport.close(failure)
+      try {
+        await process.dispose()
+      } catch (cleanupError: unknown) {
+        throw new AggregateError([failure, cleanupError], 'Codex startup failed and process cleanup failed')
+      }
+      throw failure
+    } finally {
+      clearTimeout(startupTimer)
     }
   }
 
@@ -164,48 +276,183 @@ export class CodexRuntime {
     for (const listener of [...this.eventListeners]) listener(event)
   }
 
+  private turnIdFor(params: JsonObject | undefined, item?: JsonObject): string | undefined {
+    const turn = recordField(params?.['turn'])
+    return stringField(params?.['turnId']) ?? stringField(turn?.['id']) ?? stringField(item?.['turnId'])
+  }
+
+  private isTerminal(turnId: string | undefined): boolean {
+    if (turnId === undefined) return false
+    const status = this.turnStatuses.get(turnId)
+    return status === 'completed' || status === 'interrupted' || status === 'failed'
+  }
+
+  private emitUnknownNotification(method: string, params: JsonValue | undefined): void {
+    this.emit({ type: 'unknown-notification', method, ...params === undefined ? {} : { params } })
+  }
+
+  private projectItem(method: 'started' | 'completed', params: JsonObject, item: JsonObject, turnId: string | undefined): void {
+    const type = itemType(item) ?? 'unknown'
+    const id = itemId(item, params)
+    if (type === 'agentMessage' || type === 'reasoning') {
+      this.emit({
+        type: method === 'started' ? 'item-started' : 'item-completed',
+        ...turnId === undefined ? {} : { turnId },
+        ...id === undefined ? {} : { itemId: id },
+        itemType: type,
+        item,
+        ...itemStatus(item['status']) === undefined ? {} : { status: itemStatus(item['status']) },
+        ...itemError(item) === undefined ? {} : { error: itemError(item) },
+      })
+      return
+    }
+    const tool = toolCallFromItem(item, params)
+    if (tool === undefined) {
+      this.emit({
+        type: method === 'started' ? 'item-started' : 'item-completed',
+        ...turnId === undefined ? {} : { turnId },
+        ...id === undefined ? {} : { itemId: id },
+        itemType: type,
+        item,
+        ...itemStatus(item['status']) === undefined ? {} : { status: itemStatus(item['status']) },
+        ...itemError(item) === undefined ? {} : { error: itemError(item) },
+      })
+      return
+    }
+    if (method === 'started') {
+      this.emit({ type: 'tool-call', ...turnId === undefined ? {} : { turnId }, ...tool, status: itemStatus(item['status']) ?? 'inProgress' })
+      return
+    }
+    const result = toolResultFromItem(item, params)
+    if (result !== undefined) this.emit({ type: 'tool-result', ...turnId === undefined ? {} : { turnId }, ...result })
+  }
+
+  private projectTurnStarted(params: JsonObject): void {
+    const turn = recordField(params['turn'])
+    const turnId = this.turnIdFor(params)
+    const status = turnStatus(turn?.['status']) ?? 'inProgress'
+    if (turnId === undefined || this.isTerminal(turnId)) return
+    this.turnStatuses.set(turnId, status)
+    this.emit({ type: 'turn_started', turnId, status, ...turn === undefined ? {} : { turn } })
+  }
+
+  private projectTurnCompleted(params: JsonObject): void {
+    const turn = recordField(params['turn'])
+    const turnId = this.turnIdFor(params)
+    if (turnId === undefined || this.isTerminal(turnId)) return
+    const status = turnStatus(turn?.['status']) ?? 'failed'
+    this.turnStatuses.set(turnId, status)
+    const error = turn?.['error']
+    const preservedStatus = stringField(turn?.['status']) ?? status
+    const rawUsage = recordField(turn?.['usage']) ?? recordField(params['usage']) ?? recordField(params['tokenUsage'])
+    const usage = rawUsage === undefined
+      ? undefined
+      : recordField(rawUsage['total']) !== undefined || recordField(rawUsage['last']) !== undefined || rawUsage['modelContextWindow'] !== undefined
+        ? canonicalUsage(rawUsage)
+        : rawUsage
+    if (status === 'completed') {
+      this.emit({ type: 'turn_completed', turnId, status: preservedStatus, ...usage === undefined ? {} : { usage }, ...turn === undefined ? {} : { turn } })
+      return
+    }
+    if (status === 'interrupted') {
+      this.emit({ type: 'turn_canceled', turnId, reason: safeErrorMessage(error, 'Codex turn interrupted'), status: preservedStatus, ...turn === undefined ? {} : { turn } })
+      return
+    }
+    if (status === 'inProgress') {
+      this.emit({ type: 'turn_started', turnId, status, ...turn === undefined ? {} : { turn } })
+      return
+    }
+    const errorDetails = recordField(error)
+    const codexErrorInfo = recordField(errorDetails?.['codexErrorInfo'])
+    const code = stringField(errorDetails?.['code']) ?? stringField(codexErrorInfo?.['code'])
+    const diagnostic = stringField(errorDetails?.['diagnostic']) ?? stringField(errorDetails?.['additionalDetails'])
+    this.emit({
+      type: 'turn_failed',
+      turnId,
+      error: safeErrorMessage(error),
+      ...error === undefined ? {} : { errorDetails: error },
+      ...code === undefined ? {} : { code },
+      ...diagnostic === undefined ? {} : { diagnostic },
+      status: preservedStatus,
+      ...turn === undefined ? {} : { turn },
+    })
+  }
+
   private handleNotification(method: string, rawParams: JsonValue | undefined): void {
     const params = typeof rawParams === 'object' && rawParams !== null && !Array.isArray(rawParams)
       ? rawParams as JsonObject
       : undefined
-    const eventTurnId = stringField(params?.['turnId'])
-    if (method === 'item/agentMessage/delta') {
-      const delta = stringField(params?.['delta'])
-      if (delta !== undefined) this.emit({ type: 'text-delta', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, text: delta })
+    if (params === undefined) {
+      this.emitUnknownNotification(method, rawParams)
       return
     }
-    if (method === 'item/started') {
-      const item = typeof params?.['item'] === 'object' && params['item'] !== null && !Array.isArray(params['item'])
-        ? params['item'] as JsonObject
-        : undefined
-      if (item === undefined) return
-      const tool = toolCallFromItem(item)
-      if (tool !== undefined) this.emit({ type: 'tool-call', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, ...tool })
-      return
-    }
-    if (method === 'item/completed') {
-      const item = typeof params?.['item'] === 'object' && params['item'] !== null && !Array.isArray(params['item'])
-        ? params['item'] as JsonObject
-        : undefined
-      if (item === undefined) return
-      if (toolCallFromItem(item) === undefined) return
-      const result = toolResultFromItem(item)
-      if (result !== undefined) this.emit({ type: 'tool-result', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, ...result })
+    const item = recordField(params['item'])
+    const eventTurnId = this.turnIdFor(params, item)
+    if (method === 'turn/started') {
+      this.projectTurnStarted(params)
       return
     }
     if (method === 'turn/completed') {
-      const turn = typeof params?.['turn'] === 'object' && params['turn'] !== null && !Array.isArray(params['turn'])
-        ? params['turn'] as JsonObject
-        : undefined
-      const status = stringField(turn?.['status'])
-      const error = serialized(turn?.['error'])
-      this.emit({
-        type: 'turn-completed',
-        ...eventTurnId === undefined ? {} : { turnId: eventTurnId },
-        status: status === 'completed' ? 'completed' : 'failed',
-        ...status === 'completed' || error.length === 0 ? {} : { error },
-      })
+      this.projectTurnCompleted(params)
+      return
     }
+    if (this.isTerminal(eventTurnId ?? this.turn?.id)) return
+    if (method === 'item/agentMessage/delta') {
+      const delta = stringField(params['delta'])
+      if (delta !== undefined) this.emit({ type: 'text-delta', ...eventTurnId === undefined ? {} : { turnId: eventTurnId }, ...stringField(params['itemId']) === undefined ? {} : { itemId: stringField(params['itemId']) }, text: delta })
+      return
+    }
+    if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
+      const delta = stringField(params['delta'])
+      if (delta !== undefined) this.emit({
+        type: 'reasoning',
+        ...eventTurnId === undefined ? {} : { turnId: eventTurnId },
+        ...stringField(params['itemId']) === undefined ? {} : { itemId: stringField(params['itemId']) },
+        ...numberField(params['contentIndex']) === undefined ? {} : { contentIndex: numberField(params['contentIndex']) },
+        ...numberField(params['summaryIndex']) === undefined ? {} : { summaryIndex: numberField(params['summaryIndex']) },
+        stream: method.endsWith('summaryTextDelta') ? 'summary' : 'text',
+        text: delta,
+      })
+      return
+    }
+    if (method === 'item/started') {
+      if (item !== undefined) this.projectItem('started', params, item, eventTurnId)
+      return
+    }
+    if (method === 'item/completed') {
+      if (item !== undefined) this.projectItem('completed', params, item, eventTurnId)
+      return
+    }
+    if (method === 'item/commandExecution/outputDelta' || method === 'item/fileChange/outputDelta') {
+      const delta = stringField(params['delta'])
+      if (delta !== undefined) this.emit({ type: 'tool-output-delta', ...(eventTurnId === undefined ? {} : { turnId: eventTurnId }), ...(stringField(params['itemId']) === undefined ? {} : { itemId: stringField(params['itemId']) }), itemType: method.startsWith('item/command') ? 'commandExecution' : 'fileChange', delta })
+      return
+    }
+    if (method === 'item/fileChange/patchUpdated') {
+      const changes = params['changes'] ?? params['patch']
+      this.emit({ type: 'file-change', ...(eventTurnId === undefined ? {} : { turnId: eventTurnId }), ...(stringField(params['itemId']) === undefined ? {} : { itemId: stringField(params['itemId']) }), ...(changes === undefined ? {} : { changes }), ...(params['patch'] === undefined ? {} : { patch: params['patch'] }) })
+      return
+    }
+    if (method === 'item/mcpToolCall/progress') {
+      const progress = params['progress'] ?? params['message'] ?? params['delta']
+      this.emit({ type: 'mcp-progress', ...(eventTurnId === undefined ? {} : { turnId: eventTurnId }), ...(stringField(params['itemId']) === undefined ? {} : { itemId: stringField(params['itemId']) }), ...(progress === undefined ? {} : { progress }) })
+      return
+    }
+    if (method === 'thread/tokenUsage/updated') {
+      const tokenUsage = recordField(params['tokenUsage'])
+      if (tokenUsage !== undefined) this.emit({ type: 'usage_updated', ...(eventTurnId === undefined ? {} : { turnId: eventTurnId }), usage: canonicalUsage(tokenUsage), tokenUsage })
+      return
+    }
+    if (method === 'process/outputDelta') {
+      const delta = stringField(params['delta'])
+      if (delta !== undefined) this.emit({ type: 'process-output-delta', ...(stringField(params['processId']) === undefined ? {} : { processId: stringField(params['processId']) }), delta })
+      return
+    }
+    if (method === 'process/exited') {
+      this.emit({ type: 'process-exited', ...(stringField(params['processId']) === undefined ? {} : { processId: stringField(params['processId']) }), ...(numberField(params['exitCode']) === undefined ? {} : { exitCode: numberField(params['exitCode']) }), ...(stringField(params['signal']) === undefined ? {} : { signal: stringField(params['signal']) }), ...(stringField(params['status']) === undefined ? {} : { status: stringField(params['status']) }) })
+      return
+    }
+    this.emitUnknownNotification(method, params)
   }
 
   async initialize(signal?: AbortSignal): Promise<void> {
@@ -287,9 +534,10 @@ export class CodexRuntime {
   }
 
   async close(): Promise<ProcessExit> {
-    if (this.closed) return this.process.exited
+    if (this.closePromise !== undefined) return this.closePromise
     this.closed = true
     this.transport.close()
-    return this.process.dispose()
+    this.closePromise = this.process.dispose()
+    return this.closePromise
   }
 }

@@ -5,28 +5,10 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { reado
 export type JsonObject = { readonly [key: string]: JsonValue }
 export type JsonRpcId = number | string
 
-interface JsonRpcRequest {
-  readonly jsonrpc: '2.0'
-  readonly id: JsonRpcId
-  readonly method: string
-  readonly params?: JsonValue
-}
-
-interface JsonRpcNotification {
-  readonly jsonrpc: '2.0'
-  readonly method: string
-  readonly params?: JsonValue
-}
-
-interface JsonRpcResponse {
-  readonly jsonrpc: '2.0'
-  readonly id: JsonRpcId
-  readonly result?: JsonValue
-  readonly error?: {
-    readonly code: number
-    readonly message: string
-    readonly data?: JsonValue
-  }
+interface JsonRpcError {
+  readonly code: number
+  readonly message: string
+  readonly data?: JsonValue
 }
 
 export type JsonRpcRequestHandler = (method: string, params: JsonValue | undefined) => JsonValue | Promise<JsonValue>
@@ -37,6 +19,10 @@ interface PendingRequest {
   readonly reject: (error: Error) => void
   readonly signal?: AbortSignal
   onAbort?: () => void
+}
+
+interface BlockedWrite {
+  readonly close: () => void
 }
 
 function deferred<T>(): {
@@ -61,8 +47,19 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
 function isJsonRpcId(value: unknown): value is JsonRpcId {
   return typeof value === 'string' || (typeof value === 'number' && Number.isSafeInteger(value))
+}
+
+function isJsonRpcError(value: unknown): value is JsonRpcError {
+  return isObject(value)
+    && typeof value['code'] === 'number'
+    && Number.isInteger(value['code'])
+    && typeof value['message'] === 'string'
 }
 
 function frame(value: JsonObject): string {
@@ -73,6 +70,7 @@ function frame(value: JsonObject): string {
 export class JsonRpcLineTransport {
   private readonly pending = new Map<JsonRpcId, PendingRequest>()
   private readonly notificationHandlers = new Set<JsonRpcNotificationHandler>()
+  private readonly blockedWrites = new Set<BlockedWrite>()
   private requestHandler: JsonRpcRequestHandler | undefined
   private readonly closedDeferred = deferred<void>()
   private readline: Interface | undefined
@@ -90,7 +88,7 @@ export class JsonRpcLineTransport {
   }
 
   start(): void {
-    if (this.readline !== undefined) return
+    if (this.readline !== undefined || this.closed) return
     this.readline = createInterface({ input: this.input, crlfDelay: Infinity })
     this.readline.on('line', line => this.handleLine(line))
     this.readline.on('close', () => this.close(new Error('JSON-RPC input closed')))
@@ -118,6 +116,7 @@ export class JsonRpcLineTransport {
   ): Promise<T> {
     this.assertOpen()
     if (signal?.aborted) throw this.abortError(signal)
+
     const id = this.nextId++
     const result = deferred<JsonValue>()
     const pending: PendingRequest = {
@@ -125,18 +124,24 @@ export class JsonRpcLineTransport {
       reject: result.reject,
       ...signal === undefined ? {} : { signal },
     }
+    this.pending.set(id, pending)
+
     if (signal !== undefined) {
       const onAbort = (): void => {
-        if (this.pending.delete(id)) result.reject(this.abortError(signal))
+        if (!this.pending.has(id)) return
+        this.rejectPending(id, this.abortError(signal))
       }
       pending.onAbort = onAbort
       signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
     }
-    this.pending.set(id, pending)
-    try {
-      await this.write({ jsonrpc: '2.0', id, method, ...params === undefined ? {} : { params } })
-    } catch (error: unknown) {
-      this.rejectPending(id, errorFromUnknown(error))
+
+    if (this.pending.has(id)) {
+      try {
+        await this.write({ jsonrpc: '2.0', id, method, ...params === undefined ? {} : { params } })
+      } catch (error: unknown) {
+        this.rejectPending(id, errorFromUnknown(error))
+      }
     }
     return result.promise as Promise<T>
   }
@@ -151,98 +156,173 @@ export class JsonRpcLineTransport {
     this.closed = true
     this.fatalError = error
     this.readline?.close()
-    for (const id of this.pending.keys()) this.rejectPending(id, error ?? new Error('JSON-RPC transport closed'))
+
+    const closeError = error ?? new Error('JSON-RPC transport closed')
+    for (const blockedWrite of [...this.blockedWrites]) blockedWrite.close()
+    for (const id of [...this.pending.keys()]) this.rejectPending(id, closeError)
     this.closedDeferred.resolve(undefined)
   }
 
   private async write(value: JsonObject): Promise<void> {
     if (this.closed) throw this.fatalError ?? new Error('JSON-RPC transport closed')
-    const output = frame(value)
-    if (this.output.write(output)) return
+
+    let accepted: boolean
+    try {
+      accepted = this.output.write(frame(value))
+    } catch (error: unknown) {
+      const failure = errorFromUnknown(error)
+      this.close(failure)
+      throw failure
+    }
+    if (accepted) return
+
     await new Promise<void>((resolve, reject) => {
-      const onDrain = (): void => {
-        this.output.off('error', onError)
-        resolve()
-      }
-      const onError = (error: Error): void => {
+      let settled = false
+      const cleanup = (): void => {
         this.output.off('drain', onDrain)
-        reject(error)
+        this.output.off('error', onError)
+        this.blockedWrites.delete(blockedWrite)
       }
+      const finish = (callback: () => void): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        callback()
+      }
+      const onDrain = (): void => finish(resolve)
+      const onError = (error: Error): void => {
+        const failure = errorFromUnknown(error)
+        this.close(failure)
+        finish(() => reject(failure))
+      }
+      const blockedWrite: BlockedWrite = {
+        close: () => finish(() => reject(this.fatalError ?? new Error('JSON-RPC transport closed'))),
+      }
+
+      this.blockedWrites.add(blockedWrite)
       this.output.once('drain', onDrain)
       this.output.once('error', onError)
+      if (this.closed) blockedWrite.close()
     })
   }
 
   private handleLine(line: string): void {
-    if (line.trim() === '') return
+    if (this.closed) return
+    if (line.trim() === '') {
+      this.protocolError('invalid JSON-RPC frame: empty line')
+      return
+    }
+
     let value: unknown
     try {
       value = JSON.parse(line)
-    } catch (error: unknown) {
-      this.close(new Error(`invalid JSON-RPC line: ${errorFromUnknown(error).message}`))
+    } catch {
+      this.protocolError('invalid JSON-RPC frame: malformed JSON')
       return
     }
     if (!isObject(value)) {
-      this.close(new Error('invalid JSON-RPC message'))
+      this.protocolError('invalid JSON-RPC frame: expected a JSON object')
       return
     }
-    // Codex app-server speaks JSON-RPC over stdio but omits the JSON-RPC 2.0
-    // marker on responses and notifications. Requests we send retain the
-    // marker; the reader accepts both the strict fixture shape and Codex's
-    // canonical `{id,result}` / `{method,params}` shape.
-    const protocol = value['jsonrpc']
-    if (protocol !== undefined && protocol !== '2.0') {
-      this.close(new Error('invalid JSON-RPC version'))
+
+    // Codex app-server accepts JSON-RPC-shaped messages without the marker,
+    // so the marker is optional here but must be correct when present.
+    if (hasOwn(value, 'jsonrpc') && value['jsonrpc'] !== '2.0') {
+      this.protocolError('invalid JSON-RPC frame: jsonrpc must be "2.0"')
       return
     }
-    if ('method' in value && typeof value['method'] === 'string') {
-      if ('id' in value && isJsonRpcId(value['id'])) {
-        void this.handleRequest(value['id'] as JsonRpcId, value['method'] as string, value['params'] as JsonValue | undefined)
+
+    if (hasOwn(value, 'method')) {
+      if (hasOwn(value, 'result') || hasOwn(value, 'error')) {
+        this.protocolError('invalid JSON-RPC frame: request cannot include result or error')
+        return
+      }
+      if (typeof value['method'] !== 'string') {
+        this.protocolError('invalid JSON-RPC request: method must be a string')
+        return
+      }
+      if (hasOwn(value, 'id')) {
+        if (!isJsonRpcId(value['id'])) {
+          this.protocolError('invalid JSON-RPC request id')
+          return
+        }
+        void this.handleRequest(value['id'], value['method'], value['params'] as JsonValue | undefined)
       } else {
-        for (const handler of this.notificationHandlers) handler(value['method'] as string, value['params'] as JsonValue | undefined)
+        try {
+          for (const handler of this.notificationHandlers) handler(value['method'], value['params'] as JsonValue | undefined)
+        } catch (error: unknown) {
+          this.close(errorFromUnknown(error))
+        }
       }
       return
     }
-    if (!('id' in value) || !isJsonRpcId(value['id'])) {
-      this.close(new Error('JSON-RPC response has no valid id'))
+
+    if (!hasOwn(value, 'id') || !isJsonRpcId(value['id'])) {
+      this.protocolError('invalid JSON-RPC response id')
       return
     }
-    const response = value as unknown as JsonRpcResponse
-    if (response.error !== undefined) {
-      this.rejectPending(response['id'], new Error(`JSON-RPC ${response.error.code}: ${response.error.message}`))
+    const id = value['id']
+    if (!this.pending.has(id)) {
+      this.protocolError('unknown JSON-RPC response id')
       return
     }
-    this.resolvePending(response['id'], response['result'] ?? null)
+
+    const hasResult = hasOwn(value, 'result')
+    const hasError = hasOwn(value, 'error')
+    if (hasResult === hasError) {
+      this.protocolError('invalid JSON-RPC response: expected exactly one of result or error')
+      return
+    }
+    if (hasError) {
+      if (!isJsonRpcError(value['error'])) {
+        this.protocolError('invalid JSON-RPC response error')
+        return
+      }
+      const responseError = value['error']
+      this.rejectPending(id, new Error(`JSON-RPC ${responseError.code}: ${responseError.message}`))
+      return
+    }
+    this.resolvePending(id, value['result'] as JsonValue)
   }
 
   private async handleRequest(id: JsonRpcId, method: string, params: JsonValue | undefined): Promise<void> {
+    let response: JsonObject
     if (this.requestHandler === undefined) {
-      await this.write({
+      response = {
         jsonrpc: '2.0',
         id,
-        error: { code: -32601, message: `method not supported: ${method}` },
-      })
-      return
+        error: { code: -32601, message: 'JSON-RPC method not supported' },
+      }
+    } else {
+      try {
+        const result = await this.requestHandler(method, params)
+        response = { jsonrpc: '2.0', id, result }
+      } catch {
+        // Never copy arbitrary handler errors to stdout: they may contain credentials.
+        response = {
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32000, message: 'JSON-RPC request handler failed' },
+        }
+      }
     }
+
     try {
-      const result = await this.requestHandler(method, params)
-      await this.write({ jsonrpc: '2.0', id, result })
+      await this.write(response)
     } catch (error: unknown) {
-      await this.write({
-        jsonrpc: '2.0',
-        id,
-        error: { code: -32000, message: errorFromUnknown(error).message },
-      })
+      this.close(errorFromUnknown(error))
     }
+  }
+
+  private protocolError(message: string): void {
+    this.close(new Error(message))
   }
 
   private resolvePending(id: JsonRpcId, value: JsonValue): void {
     const pending = this.pending.get(id)
     if (pending === undefined) return
     this.pending.delete(id)
-    if (pending.signal !== undefined && pending.onAbort !== undefined) {
-      pending.signal.removeEventListener('abort', pending.onAbort)
-    }
+    this.removeAbortListener(pending)
     pending.resolve(value)
   }
 
@@ -250,10 +330,14 @@ export class JsonRpcLineTransport {
     const pending = this.pending.get(id)
     if (pending === undefined) return
     this.pending.delete(id)
+    this.removeAbortListener(pending)
+    pending.reject(error)
+  }
+
+  private removeAbortListener(pending: PendingRequest): void {
     if (pending.signal !== undefined && pending.onAbort !== undefined) {
       pending.signal.removeEventListener('abort', pending.onAbort)
     }
-    pending.reject(error)
   }
 
   private assertOpen(): void {

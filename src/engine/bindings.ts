@@ -9,6 +9,9 @@ export interface ExternalEngineBinding {
   readonly nativeSessionId: string
   readonly runtimeRoot: string
   readonly selection: EngineSelection
+  /** Host-owned executable configuration; credentials must never be supplied here. */
+  readonly executable?: string
+  readonly args?: readonly string[]
 }
 
 interface ExternalEngineBindingDocument {
@@ -56,10 +59,19 @@ export class ExternalEngineBindingStore {
   }
 
   async put(binding: ExternalEngineBinding): Promise<void> {
+    const normalized: ExternalEngineBinding = {
+      sessionId: binding.sessionId,
+      engineId: binding.engineId,
+      nativeSessionId: binding.nativeSessionId,
+      runtimeRoot: binding.runtimeRoot,
+      selection: binding.selection,
+      ...binding.executable === undefined ? {} : { executable: binding.executable },
+      ...binding.args === undefined ? {} : { args: [...binding.args] },
+    }
     await withFileLock(this.file, async () => {
       const document = await this.read()
-      const bindings = document.bindings.filter(candidate => candidate.sessionId !== binding.sessionId)
-      bindings.push(binding)
+      const bindings = document.bindings.filter(candidate => candidate.sessionId !== normalized.sessionId)
+      bindings.push(normalized)
       await this.write({ version: 1, bindings })
     })
   }
@@ -72,10 +84,20 @@ export class ExternalEngineBindingStore {
         version: 1,
         bindings: value.bindings.filter(binding => binding !== null && typeof binding === 'object').map(binding => {
           const candidate = binding as ExternalEngineBinding & { threadId?: string }
+          const executable = typeof candidate.executable === 'string' && candidate.executable.trim() !== ''
+            ? candidate.executable
+            : undefined
+          const args = Array.isArray(candidate.args) && candidate.args.every((argument): argument is string => typeof argument === 'string')
+            ? [...candidate.args]
+            : undefined
           return {
-            ...candidate,
+            sessionId: candidate.sessionId,
             engineId: candidate.engineId ?? 'codex-cli',
             nativeSessionId: candidate.nativeSessionId ?? candidate.threadId ?? '',
+            runtimeRoot: candidate.runtimeRoot,
+            selection: candidate.selection,
+            ...executable === undefined ? {} : { executable },
+            ...args === undefined ? {} : { args },
           }
         }).filter(binding => binding.nativeSessionId !== ''),
       }

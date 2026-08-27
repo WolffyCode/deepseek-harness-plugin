@@ -20,6 +20,22 @@ function binding(sessionId: string): ExternalEngineBinding {
   }
 }
 
+test('binding persists custom Codex launch configuration for cold resume', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-bindings-launch-test-'))
+  const file = join(root, 'engine-bindings.json')
+  const expected: ExternalEngineBinding = {
+    ...binding('cold-session'),
+    executable: '/opt/codex-wrapper',
+    args: ['app-server', '--listen', 'stdio://'],
+  }
+  try {
+    await new ExternalEngineBindingStore(file).put(expected)
+    assert.deepEqual(await new ExternalEngineBindingStore(file).get(expected.sessionId), expected)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('binding writes from independent service instances preserve every native session', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-engine-bindings-test-'))
   const file = join(root, 'engine-bindings.json')

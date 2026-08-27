@@ -25,6 +25,7 @@ export interface OpenEngineOptions {
     readonly executable?: string;
     readonly args?: readonly string[];
     readonly disposeGraceMs?: number;
+    readonly startupTimeoutMs?: number;
     readonly runtimeRoot?: string;
     readonly preserveRuntimeRoot?: boolean;
     readonly resumeThreadId?: string;
@@ -50,6 +51,7 @@ export interface DiscoverCodexModelsOptions {
     readonly executable?: string;
     readonly args?: readonly string[];
     readonly disposeGraceMs?: number;
+    readonly startupTimeoutMs?: number;
     readonly runtimeRoot?: string;
     readonly preserveRuntimeRoot?: boolean;
     readonly resumeThreadId?: string;

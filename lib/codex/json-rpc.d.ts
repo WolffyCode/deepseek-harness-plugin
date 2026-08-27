@@ -14,6 +14,7 @@ export declare class JsonRpcLineTransport {
     private readonly output;
     private readonly pending;
     private readonly notificationHandlers;
+    private readonly blockedWrites;
     private requestHandler;
     private readonly closedDeferred;
     private readline;
@@ -31,8 +32,10 @@ export declare class JsonRpcLineTransport {
     private write;
     private handleLine;
     private handleRequest;
+    private protocolError;
     private resolvePending;
     private rejectPending;
+    private removeAbortListener;
     private assertOpen;
     private abortError;
 }

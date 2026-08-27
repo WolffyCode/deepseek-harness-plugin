@@ -10,6 +10,8 @@ export interface CodexRuntimeOptions extends CodexProcessOptions {
     readonly approvalPolicy?: JsonValue;
     readonly sandbox?: JsonValue;
     readonly serverRequestHandler?: JsonRpcRequestHandler;
+    /** Upper bound for the initialize handshake; the timer is cleared on success and failure. */
+    readonly startupTimeoutMs?: number;
 }
 export interface CodexThread {
     readonly id: string;
@@ -26,6 +28,8 @@ export declare class CodexRuntime {
     private thread;
     private turn;
     private closed;
+    private closePromise;
+    private readonly turnStatuses;
     private readonly eventListeners;
     private constructor();
     static open(options: CodexRuntimeOptions): Promise<CodexRuntime>;
@@ -33,6 +37,12 @@ export declare class CodexRuntime {
     get turnId(): string | undefined;
     onEvent(handler: ExternalEngineEventHandler): () => void;
     private emit;
+    private turnIdFor;
+    private isTerminal;
+    private emitUnknownNotification;
+    private projectItem;
+    private projectTurnStarted;
+    private projectTurnCompleted;
     private handleNotification;
     initialize(signal?: AbortSignal): Promise<void>;
     listModels(options?: {

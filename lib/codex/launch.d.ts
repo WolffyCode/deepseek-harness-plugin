@@ -4,6 +4,7 @@ import type { EngineProvider } from '../provider/types.js';
 import type { EngineProfileSnapshot } from '../profile/types.js';
 import type { JsonRpcRequestHandler } from './json-rpc.js';
 import { CodexRuntime } from './runtime.js';
+import { type CodexCredentialResolver } from './config.js';
 export interface CodexLaunchOptions {
     readonly profile: EngineProfileSnapshot;
     readonly provider: EngineProvider;
@@ -13,6 +14,7 @@ export interface CodexLaunchOptions {
     readonly executable?: string;
     readonly args?: readonly string[];
     readonly disposeGraceMs?: number;
+    readonly startupTimeoutMs?: number;
     readonly baseInstructions?: string;
     readonly ephemeral?: boolean;
     readonly runtimeRoot?: string;
@@ -22,6 +24,7 @@ export interface CodexLaunchOptions {
     readonly serverRequestHandler?: JsonRpcRequestHandler;
     readonly mcpSet?: EngineMcpSet;
     readonly skillSet?: EngineSkillSet;
+    readonly credentialResolver?: CodexCredentialResolver;
     readonly environment?: Readonly<Record<string, string>>;
 }
 export interface CodexLaunch {

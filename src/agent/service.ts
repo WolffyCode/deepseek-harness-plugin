@@ -91,7 +91,6 @@ interface CodexCommandTransport {
 interface CommandCatalogRuntime {
   readonly session?: ClaudeCommandCatalogSession
   readonly transport?: CodexCommandTransport
-  readonly threadId?: string
 }
 
 function commandCatalogRuntime(runtime: import('./runtime.js').ExternalEngineRuntime): CommandCatalogRuntime {
@@ -120,32 +119,35 @@ function normalizeCommand(command: ClaudeCommandEntry, skills: ReadonlySet<strin
   }
 }
 
-async function codexCommands(runtime: CommandCatalogRuntime, cwd: string): Promise<readonly EngineSuiteCommandView[]> {
-  if (runtime.transport === undefined || runtime.threadId === undefined) throw new Error('Codex command catalog is unavailable')
-  const response = await runtime.transport.request<JsonValue>('skills/list', { cwds: [cwd] })
+function codexSkillCommand(skill: JsonObject): EngineSuiteCommandView | undefined {
+  if (skill['enabled'] === false) return undefined
+  const name = commandString(skill['name'], '').trim()
+  if (name.length === 0) return undefined
+  const metadata = typeof skill['interface'] === 'object' && skill['interface'] !== null && !Array.isArray(skill['interface'])
+    ? skill['interface'] as JsonObject
+    : undefined
+  const description = commandString(skill['description'], commandString(metadata?.['shortDescription'], commandString(metadata?.['displayName'], '')))
+  return { name, description, argumentHint: '', source: 'skill' }
+}
+
+async function codexCommands(runtime: CommandCatalogRuntime, cwd: string, refresh: boolean): Promise<readonly EngineSuiteCommandView[]> {
+  if (runtime.transport === undefined) throw new Error('Codex command catalog is unavailable')
+  const response = await runtime.transport.request<JsonValue>('skills/list', { cwds: [cwd], forceReload: refresh })
   const root = jsonObject(response, 'skills/list response')
   const entries = root['data']
   if (!Array.isArray(entries)) throw new Error('skills/list response.data must be an array')
   const commands = new Map<string, EngineSuiteCommandView>()
-  commands.set('compact', { name: 'compact', description: 'Summarize conversation to prevent hitting the context limit', argumentHint: '', source: 'command' })
   for (const entry of entries) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
     const skills = entry['skills']
     if (!Array.isArray(skills)) continue
-    for (const skill of skills) {
-      if (typeof skill !== 'object' || skill === null || Array.isArray(skill)) continue
-      const name = commandString(skill['name'], '')
-      const path = commandString(skill['path'], '')
-      if (name.length === 0 || path.length === 0 || skill['enabled'] === false) continue
-      commands.set(name, {
-        name,
-        description: commandString(skill['description'], ''),
-        argumentHint: '',
-        source: 'skill',
-      })
+    for (const value of skills) {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+      const command = codexSkillCommand(value as JsonObject)
+      if (command !== undefined && !commands.has(command.name)) commands.set(command.name, command)
     }
   }
-  return [...commands.values()].sort((a, b) => a.name.localeCompare(b.name))
+  return [...commands.values()]
 }
 
 async function runtimeCommands(runtime: import('./runtime.js').ExternalEngineRuntime, cwd: string, refresh: boolean): Promise<readonly EngineSuiteCommandView[]> {
@@ -155,7 +157,7 @@ async function runtimeCommands(runtime: import('./runtime.js').ExternalEngineRun
     const skills = new Set((catalog.skills ?? catalogRuntime.session.catalog.skills).map(skill => skill.name))
     return catalog.commands.map(command => normalizeCommand(command, skills))
   }
-  return codexCommands(catalogRuntime, cwd)
+  return codexCommands(catalogRuntime, cwd, refresh)
 }
 
 function turnFailure(session: Session): string | undefined {
@@ -173,6 +175,7 @@ export interface CreateExternalAgentOptions {
   readonly cwd: string
   readonly executable?: string
   readonly args?: readonly string[]
+  readonly startupTimeoutMs?: number
 }
 
 interface InternalCreateExternalAgentOptions extends CreateExternalAgentOptions {
@@ -195,6 +198,7 @@ export interface DelegateExternalAgentOptions {
   /** Test/deployment executable override; the MCP bridge never carries this field. */
   readonly executable?: string
   readonly args?: readonly string[]
+  readonly startupTimeoutMs?: number
   readonly nativeTaskId?: string
 }
 
@@ -222,7 +226,6 @@ export class EngineSuiteAgentService implements AgentFactory {
   private readonly childBridgeReady: Promise<void>
   private readonly lineageStore: ParentChildLineageStore
   private readonly closedSessions = new Map<string, Session>()
-  private readonly closedProcessOptions = new Map<string, { readonly executable?: string; readonly args?: readonly string[] }>()
 
   constructor(
     private readonly ctx: Context,
@@ -319,6 +322,7 @@ export class EngineSuiteAgentService implements AgentFactory {
         cwd: parent.session.header.cwd ?? process.cwd(),
         ...request.executable === undefined ? {} : { executable: request.executable },
         ...request.args === undefined ? {} : { args: request.args },
+        ...request.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: request.startupTimeoutMs },
         session: childSession,
         parentAgent: parent.agent,
         parentSessionId,
@@ -374,7 +378,6 @@ export class EngineSuiteAgentService implements AgentFactory {
     if (binding === undefined) throw new Error(`External Engine native-session binding is missing for session ${id}`)
     const parent = lineage === undefined ? undefined : [...this.live].find(candidate => String(candidate.session.id) === lineage.parentSessionId)
     const persisted = this.closedSessions.get(id)
-    const processOptions = this.closedProcessOptions.get(id)
     const persistence = ownerCtx.get('sessionPersistence') as SessionPersistenceLike | undefined
     let session: Session
     let releasePreparation: (() => void) | undefined
@@ -396,13 +399,14 @@ export class EngineSuiteAgentService implements AgentFactory {
         apiKey: await this.resolveApiKey(provider.credentialRef),
         cwd: session.header.cwd ?? process.cwd(),
         session,
+        runtimeRoot: binding.runtimeRoot,
+        preserveRuntimeRoot: true,
         ...hasConversation ? {
-          runtimeRoot: binding.runtimeRoot,
-          preserveRuntimeRoot: true,
           resumeThreadId: binding.nativeSessionId,
           engineId: binding.engineId,
-          ...processOptions ?? {},
         } : {},
+        ...binding.executable === undefined ? {} : { executable: binding.executable },
+        ...binding.args === undefined ? {} : { args: [...binding.args] },
         ...parent === undefined || lineage === undefined ? {} : { parentAgent: parent.agent, parentSessionId: String(parent.session.id), delegationDepth: lineage.depth, nativeTaskId: lineage.nativeTaskId },
       })
       this.closedSessions.delete(id)
@@ -454,7 +458,6 @@ export class EngineSuiteAgentService implements AgentFactory {
     }
     if (handle !== undefined) await handle.dispose()
     this.closedSessions.delete(id)
-    this.closedProcessOptions.delete(id)
     return this.lineageStore.update(id, { status: 'archived' })
   }
 
@@ -609,6 +612,10 @@ export class EngineSuiteAgentService implements AgentFactory {
     const bridge = profile.allowedChildProfiles.length === 0
       ? undefined
       : await this.childBridgeReady.then(() => this.childBridge.launchFor(String(id)))
+    const environment = { ...bridge?.environment ?? {} }
+    const internalMcpSet: EngineMcpSet | undefined = bridge === undefined
+      ? undefined
+      : { id: 'engine-suite-child-bridge', servers: [{ ...bridge.mcpServer, args: [...bridge.mcpServer.args] }] }
     const launch = await this.suite.openEngine(options.selection, {
       apiKey: options.apiKey,
       cwd: options.cwd,
@@ -617,9 +624,12 @@ export class EngineSuiteAgentService implements AgentFactory {
       ...options.resumeThreadId === undefined ? {} : { resumeThreadId: options.resumeThreadId },
       ...options.executable === undefined ? {} : { executable: options.executable },
       ...options.args === undefined ? {} : { args: options.args },
+      ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
       ...permissionPreset === undefined ? {} : { permissionPreset },
       serverRequestHandler,
-      ...bridge === undefined ? {} : { internalMcpSet: { id: 'engine-suite-child-bridge', servers: [{ ...bridge.mcpServer, args: [...bridge.mcpServer.args] }] }, environment: bridge.environment },
+      environment,
+      ...profile.engineId === 'codex-cli' ? { credentialResolver: this.resolveApiKey } : {},
+      ...internalMcpSet === undefined ? {} : { internalMcpSet },
     })
     let detachSession: (() => void) | undefined
     let detachAgent: (() => void) | undefined
@@ -662,9 +672,13 @@ export class EngineSuiteAgentService implements AgentFactory {
         nativeSessionId: launch.nativeSessionId,
         runtimeRoot,
         selection: options.selection,
+        ...options.executable === undefined ? {} : { executable: options.executable },
+        ...options.args === undefined ? {} : { args: [...options.args] },
       })
       let activeLaunch = launch
       let activeApiKey = options.apiKey
+      let activeEnvironment: Readonly<Record<string, string>> = environment
+      let activeInternalMcpSet: EngineMcpSet | undefined = internalMcpSet
       let commandCatalog: readonly EngineSuiteCommandView[] | undefined
       let commandOperation: Promise<readonly EngineSuiteCommandView[]> | undefined
       let commandClosed = false
@@ -709,6 +723,10 @@ export class EngineSuiteAgentService implements AgentFactory {
           const nextBridge = nextProfile.allowedChildProfiles.length === 0
             ? undefined
             : await this.childBridgeReady.then(() => this.childBridge.launchFor(String(id)))
+          const nextEnvironment = { ...nextBridge?.environment ?? {} }
+          const nextInternalMcpSet: EngineMcpSet | undefined = nextBridge === undefined
+            ? undefined
+            : { id: 'engine-suite-child-bridge', servers: [{ ...nextBridge.mcpServer, args: [...nextBridge.mcpServer.args] }] }
           const launchOptions: Parameters<EngineSuiteRuntime['openEngine']>[1] = {
             apiKey: nextApiKey,
             cwd: session.header.cwd ?? options.cwd,
@@ -719,9 +737,12 @@ export class EngineSuiteAgentService implements AgentFactory {
               : {},
             ...options.executable === undefined ? {} : { executable: options.executable },
             ...options.args === undefined ? {} : { args: options.args },
+            ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
             ...nextPermissionPreset === undefined ? {} : { permissionPreset: nextPermissionPreset },
             serverRequestHandler,
-                  ...nextBridge === undefined ? {} : { internalMcpSet: { id: 'engine-suite-child-bridge', servers: [{ ...nextBridge.mcpServer, args: [...nextBridge.mcpServer.args] }] }, environment: nextBridge.environment },
+            environment: nextEnvironment,
+            ...nextProfile.engineId === 'codex-cli' ? { credentialResolver: this.resolveApiKey } : {},
+            ...nextInternalMcpSet === undefined ? {} : { internalMcpSet: nextInternalMcpSet },
           }
           await previousLaunch.close()
           let nextLaunch: Awaited<ReturnType<EngineSuiteRuntime['openEngine']>>
@@ -744,9 +765,13 @@ export class EngineSuiteAgentService implements AgentFactory {
                   : {},
                 ...options.executable === undefined ? {} : { executable: options.executable },
                 ...options.args === undefined ? {} : { args: options.args },
+                ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
                 ...previousPermissionPreset === undefined ? {} : { permissionPreset: previousPermissionPreset },
                 serverRequestHandler,
-                        })
+                environment: activeEnvironment,
+                ...previousSelection.engineId === 'codex-cli' ? { credentialResolver: this.resolveApiKey } : {},
+                ...activeInternalMcpSet === undefined ? {} : { internalMcpSet: activeInternalMcpSet },
+              })
               activeLaunch = restored
             } catch {
               // Keep the original failure; the next user action can recreate the runtime through resume.
@@ -756,6 +781,8 @@ export class EngineSuiteAgentService implements AgentFactory {
           agent!.replaceRuntime(nextLaunch.runtime, nextProvider.id, nextModel.modelId)
           activeLaunch = nextLaunch
           activeApiKey = nextApiKey
+          activeEnvironment = nextEnvironment
+          activeInternalMcpSet = nextInternalMcpSet
           commandCatalog = undefined
           handle.profileId = nextProfile.id
           handle.selection = nextSelection
@@ -770,6 +797,8 @@ export class EngineSuiteAgentService implements AgentFactory {
             nativeSessionId: nextLaunch.nativeSessionId,
             runtimeRoot: nextLaunch.runtimeRoot,
             selection: nextSelection,
+            ...options.executable === undefined ? {} : { executable: options.executable },
+            ...options.args === undefined ? {} : { args: [...options.args] },
           })
         },
         dispose: () => {
@@ -780,10 +809,6 @@ export class EngineSuiteAgentService implements AgentFactory {
             await Promise.all(childHandles.map(child => child.dispose()))
             this.children.delete(String(id))
             this.closedSessions.set(String(id), session)
-            this.closedProcessOptions.set(String(id), {
-              ...options.executable === undefined ? {} : { executable: options.executable },
-              ...options.args === undefined ? {} : { args: [...options.args] },
-            })
             this.live.delete(handle)
             commandClosed = true
             commandCatalog = undefined

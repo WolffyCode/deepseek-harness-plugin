@@ -60,4 +60,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **162 tests / 160 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。两个 skip 仅来自缺少必需的真实 Claude Provider 环境变量；带凭据的真实 Claude、MCP/Skill 和浏览器 E2E 必须单独执行，不能由这两个 skip 代替。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。两个 skip 仅来自缺少必需的真实 Claude Provider 环境变量；带凭据的真实 Claude、MCP/Skill 和浏览器 E2E 必须单独执行，不能由这两个 skip 代替。

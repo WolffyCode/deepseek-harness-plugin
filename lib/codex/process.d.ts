@@ -19,16 +19,34 @@ export declare class CodexProcess {
     private readonly scrubber;
     readonly child: ChildProcessWithoutNullStreams;
     private stderr;
-    private disposed;
-    private readonly exitPromise;
+    private stderrPending;
+    private readonly redactions;
+    private readonly exitObservedPromise;
     private readonly closePromise;
     private readonly terminationPromise;
+    private readonly scrubberStopPromise;
+    private exitObserved;
+    private closeObserved;
+    private terminated;
+    private streamError;
+    private disposePromise;
     private constructor();
     static start(options: CodexProcessOptions): CodexProcess;
+    get stdin(): ChildProcessWithoutNullStreams['stdin'];
+    get stdout(): ChildProcessWithoutNullStreams['stdout'];
+    get stderrStream(): ChildProcessWithoutNullStreams['stderr'];
     get stderrTail(): string;
     get exited(): Promise<ProcessExit>;
+    /** Explicit child-process signals are kept separate from the idempotent close path. */
+    kill(signal: NodeJS.Signals): boolean;
     dispose(): Promise<ProcessExit>;
+    close(): Promise<ProcessExit>;
+    private disposeOnce;
+    private disposedResult;
+    private appendStderr;
+    private flushStderr;
     private waitForTermination;
+    private redactError;
 }
 export declare function waitForProcessExit(process: CodexProcess): Promise<ProcessExit>;
 export declare function waitForChildClose(child: ChildProcessWithoutNullStreams): Promise<void>;

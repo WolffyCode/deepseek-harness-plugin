@@ -78,6 +78,6 @@ pnpm pack --dry-run
 git diff --check
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **162 tests / 160 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。真实 Provider 结果必须以本次 preflight 为准；`endpoint-mismatch`、认证、网络和协议错误都必须失败，只有缺少必需外部环境变量时才显式 skip。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。真实 Provider 结果必须以本次 preflight 为准；`endpoint-mismatch`、认证、网络和协议错误都必须失败，只有缺少必需外部环境变量时才显式 skip。
 
 pnpm 的独立仓库修复、依赖版本选择和 Typert generator 发布依赖见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。

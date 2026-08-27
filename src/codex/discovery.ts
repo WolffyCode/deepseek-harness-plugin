@@ -13,6 +13,7 @@ export interface CodexModelDiscoveryOptions {
   readonly executable?: string
   readonly args?: readonly string[]
   readonly disposeGraceMs?: number
+  readonly startupTimeoutMs?: number
 }
 
 function stringField(value: unknown, name: string): string | undefined {
@@ -45,6 +46,7 @@ export async function discoverCodexModels(options: CodexModelDiscoveryOptions): 
     ...options.executable === undefined ? {} : { executable: options.executable },
     ...options.args === undefined ? {} : { args: options.args },
     ...options.disposeGraceMs === undefined ? {} : { disposeGraceMs: options.disposeGraceMs },
+    ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
     modelProvider: materialized.modelProvider,
     env: { CODEX_HOME: codexHome, ...materialized.environment },
     redactions: [...materialized.redactions],
@@ -70,6 +72,8 @@ export async function discoverCodexModels(options: CodexModelDiscoveryOptions): 
         ...description === undefined ? {} : { description },
         reasoningOptions: efforts,
         ...defaultReasoning === undefined ? {} : { defaultReasoningEffort: defaultReasoning },
+        enabled: entry['enabled'] !== false,
+        hidden,
         contextWindowSource: 'unknown',
         source: 'discovered',
       })]

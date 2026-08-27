@@ -7,7 +7,7 @@ import type { EngineProvider } from '../provider/types.js'
 import type { EngineProfileSnapshot } from '../profile/types.js'
 import type { JsonRpcRequestHandler } from './json-rpc.js'
 import { CodexRuntime, type CodexRuntimeOptions } from './runtime.js'
-import { renderCodexConfig } from './config.js'
+import { renderCodexConfig, resolveCodexMcpEnvironment, type CodexCredentialResolver } from './config.js'
 
 export interface CodexLaunchOptions {
   readonly profile: EngineProfileSnapshot
@@ -18,6 +18,7 @@ export interface CodexLaunchOptions {
   readonly executable?: string
   readonly args?: readonly string[]
   readonly disposeGraceMs?: number
+  readonly startupTimeoutMs?: number
   readonly baseInstructions?: string
   readonly ephemeral?: boolean
   readonly runtimeRoot?: string
@@ -27,6 +28,7 @@ export interface CodexLaunchOptions {
   readonly serverRequestHandler?: JsonRpcRequestHandler
   readonly mcpSet?: EngineMcpSet
   readonly skillSet?: EngineSkillSet
+  readonly credentialResolver?: CodexCredentialResolver
   readonly environment?: Readonly<Record<string, string>>
 }
 
@@ -38,77 +40,187 @@ export interface CodexLaunch {
   close(): Promise<void>
 }
 
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value))
+}
+
+function memoizedCredentialResolver(resolver: CodexCredentialResolver): CodexCredentialResolver {
+  const pending = new Map<string, Promise<string | undefined>>()
+  return reference => {
+    const existing = pending.get(reference)
+    if (existing !== undefined) return existing
+    const next = Promise.resolve().then(() => resolver(reference))
+    pending.set(reference, next)
+    return next
+  }
+}
+
+function assertMcpEnvironmentDoesNotShadowLaunchEnvironment(
+  mcpEnvironment: Readonly<Record<string, string>>,
+  environment: Readonly<Record<string, string>> | undefined,
+): void {
+  for (const key of Object.keys(mcpEnvironment)) {
+    if (key === 'OPENAI_API_KEY' || key === 'CODEX_HOME') {
+      throw new Error(`Codex MCP credential target is reserved by the launcher: ${key}`)
+    }
+    if (environment !== undefined && Object.prototype.hasOwnProperty.call(environment, key)) {
+      throw new Error(`Codex MCP credential target conflicts with launch environment: ${key}`)
+    }
+  }
+}
+
+function validateLaunchSelection(options: CodexLaunchOptions): string {
+  if (options.profile.engineId !== 'codex-cli') {
+    throw new Error(`unsupported Codex profile engine: ${options.profile.engineId}`)
+  }
+  if (options.provider.engineId !== 'codex-cli') {
+    throw new Error(`provider is not a Codex provider: ${options.provider.id}`)
+  }
+  if (options.provider.wireApi !== 'responses') {
+    throw new Error(`Codex provider ${options.provider.id} must use the Responses API wire protocol`)
+  }
+  if (options.provider.authMode !== 'api-key') {
+    throw new Error(`Codex provider ${options.provider.id} must use API-key authentication`)
+  }
+  if (options.model.engineId !== 'codex-cli' || options.model.providerId !== options.provider.id) {
+    throw new Error(`model does not belong to Codex provider ${options.provider.id}`)
+  }
+  if (options.profile.providerId !== options.provider.id) {
+    throw new Error(`profile provider does not match launch provider: ${options.profile.providerId}`)
+  }
+  if (options.profile.modelRecordId !== options.model.id) {
+    throw new Error(`profile model does not match launch model: ${options.profile.modelRecordId}`)
+  }
+  if (options.profile.modelId !== options.model.modelId) {
+    throw new Error(`profile model id does not match launch model: ${options.profile.modelId}`)
+  }
+  if (options.profile.reasoningEffort !== undefined
+    && options.model.reasoningOptions.length > 0
+    && !options.model.reasoningOptions.some(option => option.id === options.profile.reasoningEffort)) {
+    throw new Error(`profile reasoning effort is not supported by launch model: ${options.profile.reasoningEffort}`)
+  }
+  const apiKey = options.apiKey.trim()
+  if (apiKey.length === 0) throw new Error('Codex API key must not be empty')
+  return apiKey
+}
+
+async function cleanupFailedLaunch(
+  runtime: CodexRuntime | undefined,
+  runtimeRoot: string,
+  preserveRuntimeRoot: boolean,
+  original: unknown,
+): Promise<never> {
+  const errors: Error[] = [asError(original)]
+  if (runtime !== undefined) {
+    try {
+      await runtime.close()
+    } catch (error: unknown) {
+      errors.push(asError(error))
+    }
+  }
+  if (!preserveRuntimeRoot) {
+    try {
+      await rm(runtimeRoot, { recursive: true, force: true })
+    } catch (error: unknown) {
+      errors.push(asError(error))
+    }
+  }
+  if (errors.length === 1) throw original
+  throw new AggregateError(errors, 'Codex launch failed and cleanup also failed')
+}
+
 /**
  * Materializes one profile into an isolated CODEX_HOME and starts one Codex
  * app-server. The API key is passed through the child environment only; it is
  * never written to config.toml.
  */
 export async function openCodexLaunch(options: CodexLaunchOptions): Promise<CodexLaunch> {
-  if (options.profile.engineId !== 'codex-cli') throw new Error(`unsupported Codex profile engine: ${options.profile.engineId}`)
-  if (options.provider.engineId !== 'codex-cli') throw new Error(`provider is not a Codex provider: ${options.provider.id}`)
-  if (options.model.engineId !== 'codex-cli' || options.model.providerId !== options.provider.id) {
-    throw new Error(`model does not belong to Codex provider ${options.provider.id}`)
-  }
-  if (options.profile.modelRecordId !== options.model.id) {
-    throw new Error(`profile model does not match launch model: ${options.profile.modelRecordId}`)
-  }
-  if (options.profile.providerId !== options.provider.id) {
-    throw new Error(`profile provider does not match launch provider: ${options.profile.providerId}`)
-  }
-  const apiKey = options.apiKey.trim()
-  if (apiKey.length === 0) throw new Error('Codex API key must not be empty')
+  const apiKey = validateLaunchSelection(options)
   const runtimeRoot = options.runtimeRoot ?? await mkdtemp(join(tmpdir(), 'dsh-engine-suite-codex-'))
   const codexHome = join(runtimeRoot, 'codex-home')
-  await mkdir(codexHome, { recursive: true })
-  const materialized = renderCodexConfig({
-    providerName: options.provider.id,
-    baseUri: options.provider.baseUri,
-    model: options.model.modelId,
-    apiKey,
-    ...options.mcpSet === undefined ? {} : { mcpSet: options.mcpSet },
-  })
-  await writeFile(join(codexHome, 'config.toml'), materialized.configToml, { encoding: 'utf8', mode: 0o600 })
-  const runtimeOptions: CodexRuntimeOptions = {
-    cwd: options.cwd,
-    ...options.executable === undefined ? {} : { executable: options.executable },
-    ...options.args === undefined ? {} : { args: options.args },
-    ...options.disposeGraceMs === undefined ? {} : { disposeGraceMs: options.disposeGraceMs },
-    modelProvider: materialized.modelProvider,
-    model: options.model.modelId,
-    ...options.profile.reasoningEffort === undefined ? {} : { reasoningEffort: options.profile.reasoningEffort },
-    ...options.baseInstructions === undefined ? {} : { baseInstructions: options.baseInstructions },
-    ephemeral: options.ephemeral ?? false,
-    ...options.permissionPreset === 'read-only' ? { approvalPolicy: 'on-request' as const, sandbox: 'read-only' as const } : {},
-    ...options.permissionPreset === 'workspace-write' ? { approvalPolicy: 'on-request' as const, sandbox: 'workspace-write' as const } : {},
-    ...options.permissionPreset === 'danger-full-access' ? { approvalPolicy: 'never' as const, sandbox: 'danger-full-access' as const } : {},
-    env: {
-      CODEX_HOME: codexHome,
-      ...materialized.environment,
-      ...options.environment ?? {},
-    },
-    redactions: [...materialized.redactions, ...Object.values(options.environment ?? {})],
-    ...options.serverRequestHandler === undefined ? {} : { serverRequestHandler: options.serverRequestHandler },
-  }
-  let runtime: CodexRuntime
+  let runtime: CodexRuntime | undefined
+
   try {
+    await mkdir(codexHome, { recursive: true })
+    const mcpEnvironment = await resolveCodexMcpEnvironment(
+      options.mcpSet,
+      memoizedCredentialResolver(options.credentialResolver ?? (() => undefined)),
+    )
+    assertMcpEnvironmentDoesNotShadowLaunchEnvironment(mcpEnvironment, options.environment)
+    const materialized = renderCodexConfig({
+      providerName: options.provider.id,
+      baseUri: options.provider.baseUri,
+      model: options.model.modelId,
+      apiKey,
+      ...options.mcpSet === undefined ? {} : { mcpSet: options.mcpSet },
+    })
+    await writeFile(join(codexHome, 'config.toml'), materialized.configToml, { encoding: 'utf8', mode: 0o600 })
+
+    const runtimeOptions: CodexRuntimeOptions = {
+      cwd: options.cwd,
+      ...options.executable === undefined ? {} : { executable: options.executable },
+      ...options.args === undefined ? {} : { args: options.args },
+      ...options.disposeGraceMs === undefined ? {} : { disposeGraceMs: options.disposeGraceMs },
+      ...options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs },
+      modelProvider: materialized.modelProvider,
+      model: options.model.modelId,
+      ...options.profile.reasoningEffort === undefined ? {} : { reasoningEffort: options.profile.reasoningEffort },
+      ...options.baseInstructions === undefined ? {} : { baseInstructions: options.baseInstructions },
+      ephemeral: options.ephemeral ?? false,
+      ...options.permissionPreset === 'read-only' ? { approvalPolicy: 'on-request' as const, sandbox: 'read-only' as const } : {},
+      ...options.permissionPreset === 'workspace-write' ? { approvalPolicy: 'on-request' as const, sandbox: 'workspace-write' as const } : {},
+      ...options.permissionPreset === 'danger-full-access' ? { approvalPolicy: 'never' as const, sandbox: 'danger-full-access' as const } : {},
+      env: {
+        ...options.environment ?? {},
+        ...mcpEnvironment,
+        ...materialized.environment,
+        CODEX_HOME: codexHome,
+      },
+      redactions: [
+        ...materialized.redactions,
+        ...Object.values(mcpEnvironment),
+        ...Object.values(options.environment ?? {}).filter(value => value.length > 0),
+      ],
+      ...options.serverRequestHandler === undefined ? {} : { serverRequestHandler: options.serverRequestHandler },
+    }
+
     runtime = await CodexRuntime.open(runtimeOptions)
     if (options.resumeThreadId === undefined) await runtime.startThread()
     else await runtime.resumeThread(options.resumeThreadId)
+    const roots = options.skillSet === undefined ? undefined : [...new Set(options.skillSet.additionalDirectories)]
+    if (roots !== undefined) {
+      await runtime.transport.request('skills/extraRoots/set', { extraRoots: roots })
+    }
   } catch (error: unknown) {
-    await rm(runtimeRoot, { recursive: true, force: true })
-    throw error
+    return cleanupFailedLaunch(runtime, runtimeRoot, options.preserveRuntimeRoot === true, error)
   }
-  let closed = false
+
+  let closePromise: Promise<void> | undefined
   return {
     runtime,
     profile: options.profile,
     runtimeRoot,
     codexHome,
-    async close(): Promise<void> {
-      if (closed) return
-      closed = true
-      await runtime.close()
-      if (options.preserveRuntimeRoot !== true) await rm(runtimeRoot, { recursive: true, force: true })
+    close(): Promise<void> {
+      if (closePromise !== undefined) return closePromise
+      closePromise = (async () => {
+        const errors: Error[] = []
+        try {
+          await runtime?.close()
+        } catch (error: unknown) {
+          errors.push(asError(error))
+        }
+        if (options.preserveRuntimeRoot !== true) {
+          try {
+            await rm(runtimeRoot, { recursive: true, force: true })
+          } catch (error: unknown) {
+            errors.push(asError(error))
+          }
+        }
+        if (errors.length === 1) throw errors[0]
+        if (errors.length > 1) throw new AggregateError(errors, 'Codex launch close failed')
+      })()
+      return closePromise
     },
   }
 }
