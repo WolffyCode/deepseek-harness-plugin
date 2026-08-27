@@ -14,9 +14,10 @@ export interface ClaudeProcessExit {
 /**
  * Owns the Claude CLI child used by the SDK bridge.
  *
- * The SDK passes a complete environment to custom spawners. It is intentionally
- * copied as-is rather than merged with the host environment, so credentials or
- * provider settings from the parent shell cannot leak into the Claude process.
+ * The SDK supplies the child environment explicitly. It is copied without
+ * merging the host environment, except for the host executable search path when
+ * the SDK did not provide one; credentials and provider settings never leak from
+ * the parent shell into the Claude process.
  */
 export declare class ClaudeProcess implements SpawnedProcess {
     private readonly child;

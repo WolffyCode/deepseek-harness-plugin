@@ -84,6 +84,80 @@ test('ClaudeProviderSession maps streaming timeline, reasoning, tools, usage and
   await session.close()
 })
 
+test('ClaudeProviderSession maps MCP result block variants and nested content', async () => {
+  let query!: FakeQuery
+  const session = createClaudeProviderSession({
+    cwd: process.cwd(),
+    queryFactory: ({ options }) => {
+      query = new FakeQuery(options)
+      return query as unknown as Query
+    },
+  })
+  const events: ClaudeAdapterEvent[] = []
+  session.subscribe(event => events.push(event))
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
+  const turnPromise = session.run('use the MCP tool')
+  query.push(init(nativeSessionId))
+  query.push({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'mcp_tool_use', id: 'mcp-tool-1', name: 'mcp__asset-fixture__asset_echo', input: { text: 'input' } }] },
+  } as unknown as SDKMessage)
+  query.push({
+    type: 'user',
+    message: {
+      content: [{
+        type: 'mcp_tool_result',
+        tool_use_id: 'mcp-tool-1',
+        content: [{ type: 'text', text: 'MCP_FIXTURE_RESULT:' }, { content: [{ type: 'text', text: 'input' }] }],
+        isError: false,
+      }],
+    },
+  } as unknown as SDKMessage)
+  query.push({ type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: nativeSessionId } as unknown as SDKMessage)
+  await turnPromise
+
+  const toolCall = events.find(event => event.type === 'timeline' && event.item.type === 'tool_call')
+  const toolResult = events.find(event => event.type === 'timeline' && event.item.type === 'tool_result')
+  assert.equal(toolCall?.type, 'timeline')
+  assert.equal(toolCall?.item.name, 'mcp__asset-fixture__asset_echo')
+  assert.equal(toolResult?.type, 'timeline')
+  assert.equal(toolResult?.item.output, 'MCP_FIXTURE_RESULT:input')
+  assert.equal(toolResult?.item.isError, false)
+  await session.close()
+})
+
+
+test('ClaudeProviderSession projects local slash-command output into final text', async () => {
+  let query!: FakeQuery
+  const session = createClaudeProviderSession({
+    cwd: process.cwd(),
+    queryFactory: ({ options }) => {
+      query = new FakeQuery(options)
+      return query as unknown as Query
+    },
+  })
+  const events: ClaudeAdapterEvent[] = []
+  session.subscribe(event => events.push(event))
+  const nativeSessionId = query.options.sessionId
+  assert.ok(typeof nativeSessionId === 'string')
+  const resultPromise = session.run('/claude-asset-e2e')
+  query.push(init(nativeSessionId))
+  query.push({
+    type: 'system',
+    subtype: 'local_command_output',
+    content: 'CLAUDE_SKILL_ASSET_OK',
+    session_id: nativeSessionId,
+  } as unknown as SDKMessage)
+  query.push({ type: 'result', subtype: 'success', is_error: false, result: '', session_id: nativeSessionId } as unknown as SDKMessage)
+
+  const result = await resultPromise
+  assert.equal(result.finalText, 'CLAUDE_SKILL_ASSET_OK')
+  assert.equal(events.some(event => event.type === 'timeline' && event.item.type === 'assistant_message' && event.item.text === 'CLAUDE_SKILL_ASSET_OK'), true)
+  await session.close()
+})
+
 test('ClaudeProviderSession waits for permission response and supports resume', async () => {
   let query!: FakeQuery
   const session = createClaudeProviderSession({ cwd: process.cwd(), resumeSessionId: 'resume-me', queryFactory: ({ options }) => { query = new FakeQuery(options); return query as unknown as Query } })
@@ -154,6 +228,57 @@ test('ClaudeProviderSession registers SDK permission requests before notifying U
   assert.equal(session.pendingPermissions().length, 0)
   assert.equal(events.filter(event => event.type === 'permission_resolved').length, 2)
   await session.close()
+})
+
+
+test('ClaudeProviderSession supplies original tool input for every SDK allow path', async () => {
+  const originalInput = { text: 'MCP_ASSET_INPUT' }
+  let handlerQuery!: FakeQuery
+  const handlerSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    permissionHandler: async () => ({ behavior: 'allow' }),
+    queryFactory: ({ options }) => {
+      handlerQuery = new FakeQuery(options)
+      return handlerQuery as unknown as Query
+    },
+  })
+  let defaultQuery!: FakeQuery
+  const defaultSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    defaultPermission: { behavior: 'allow' },
+    queryFactory: ({ options }) => {
+      defaultQuery = new FakeQuery(options)
+      return defaultQuery as unknown as Query
+    },
+  })
+  let interactiveQuery!: FakeQuery
+  const interactiveSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    queryFactory: ({ options }) => {
+      interactiveQuery = new FakeQuery(options)
+      return interactiveQuery as unknown as Query
+    },
+  })
+  interactiveSession.subscribe(event => {
+    if (event.type === 'permission_requested') {
+      assert.equal(interactiveSession.respondToPermission(event.request.requestId, { behavior: 'allow' }), true)
+    }
+  })
+
+  try {
+    const requestOptions = (requestId: string) => ({ requestId, toolUseID: `${requestId}-tool`, signal: new AbortController().signal })
+    const handlerResult = await handlerQuery.options.canUseTool!('mcp__asset-fixture__asset_echo', originalInput, requestOptions('handler'))
+    const defaultResult = await defaultQuery.options.canUseTool!('mcp__asset-fixture__asset_echo', originalInput, requestOptions('default'))
+    const interactiveResult = await interactiveQuery.options.canUseTool!('mcp__asset-fixture__asset_echo', originalInput, requestOptions('interactive'))
+
+    assert.deepEqual(handlerResult, { behavior: 'allow', updatedInput: originalInput })
+    assert.deepEqual(defaultResult, { behavior: 'allow', updatedInput: originalInput })
+    assert.deepEqual(interactiveResult, { behavior: 'allow', updatedInput: originalInput })
+  } finally {
+    await handlerSession.close()
+    await defaultSession.close()
+    await interactiveSession.close()
+  }
 })
 
 test('ClaudeProviderSession handles failure and cancellation without leaking active turns', async () => {
@@ -239,6 +364,7 @@ test('ClaudeProviderSession composes permission, dialog, catalog, MCP and Skill 
 
   const sdkOptions = query.options as Record<string, unknown>
   assert.equal(Object.hasOwn(sdkOptions, 'allowDangerouslySkipPermissions'), false, 'default permission mode must not launch with bypass enabled')
+  assert.equal(sdkOptions['strictMcpConfig'], true, 'Claude must use only explicitly injected MCP servers')
   assert.deepEqual(sdkOptions['mcpServers'], {
     'workspace-tools': {
       type: 'stdio',

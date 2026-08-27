@@ -56,6 +56,25 @@ test('ClaudeProcess isolates the environment and preserves stdin/stdout streamin
   }
 })
 
+test('ClaudeProcess preserves the host executable search path without inheriting other host variables', async () => {
+  const hostOnly = `claude-path-host-${process.pid}`
+  const childOnly = `claude-path-child-${process.pid}`
+  process.env[hostOnly] = 'must-not-leak'
+  const child = ClaudeProcess.start({
+    command: process.execPath,
+    args: ['-e', "process.stdout.write(JSON.stringify({path:process.env['PATH'] ?? process.env['Path'], host:process.env[process.argv[1]], child:process.env[process.argv[2]]})+'\\n'); process.stdin.on('data', () => {})", hostOnly, childOnly],
+    env: { [childOnly]: 'present' },
+    signal: new AbortController().signal,
+  })
+  const lines = new LineReader(child.stdout)
+  try {
+    assert.equal(await lines.next(), JSON.stringify({ path: process.env['PATH'] ?? process.env['Path'], child: 'present' }))
+  } finally {
+    delete process.env[hostOnly]
+    await child.close()
+  }
+})
+
 test('ClaudeProcess redacts stderr and streams at least 10k chunks before close', async () => {
   const count = 10_000
   const secret = 'claude-process-secret'

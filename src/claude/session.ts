@@ -126,11 +126,22 @@ function serialize(value: unknown): string {
 }
 function contentText(value: unknown): string {
   if (typeof value === 'string') return value
-  if (!Array.isArray(value)) return serialize(value)
-  return value.map(item => {
-    const record = asRecord(item)
-    return stringValue(record?.['text']) ?? stringValue(record?.['content']) ?? ''
-  }).join('')
+  if (Array.isArray(value)) return value.map(item => contentText(item)).join('')
+  const record = asRecord(value)
+  if (record === undefined) return serialize(value)
+  const text = stringValue(record['text'])
+  if (text !== undefined) return text
+  if (record['content'] !== undefined) return contentText(record['content'])
+  if (record['output_text'] !== undefined) return contentText(record['output_text'])
+  return serialize(value)
+}
+
+function isToolUseBlockType(value: unknown): boolean {
+  return value === 'tool_use' || value === 'mcp_tool_use' || value === 'server_tool_use'
+}
+
+function isToolResultBlockType(value: unknown): boolean {
+  return value === 'tool_result' || value === 'mcp_tool_result' || value === 'server_tool_result'
 }
 
 function appendTail(current: string, chunk: string, maxBytes = 4_000): string {
@@ -187,12 +198,12 @@ function normalizeSdkModel(value: unknown): SdkModelInfo | undefined {
     ...(supportsAutoMode === undefined ? {} : { supportsAutoMode }),
   }
 }
-function permissionDecisionForSdk(decision: ClaudePermissionHandlerResult): PermissionResult {
+function permissionDecisionForSdk(decision: ClaudePermissionHandlerResult, originalInput: Record<string, unknown>): PermissionResult {
   if (decision.behavior === 'deny') return decision
-  const updatedInput = asRecord(decision.updatedInput)
+  const updatedInput = decision.updatedInput === undefined ? originalInput : asRecord(decision.updatedInput) ?? originalInput
   return {
     behavior: 'allow',
-    ...(updatedInput === undefined ? {} : { updatedInput }),
+    updatedInput,
     ...(decision.updatedPermissions === undefined ? {} : { updatedPermissions: decision.updatedPermissions }),
     ...(decision.toolUseID === undefined ? {} : { toolUseID: decision.toolUseID }),
     ...(decision.decisionClassification === undefined ? {} : { decisionClassification: decision.decisionClassification }),
@@ -781,6 +792,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       enableFileCheckpointing: true,
       ...(this.options.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
       settingSources: [],
+      strictMcpConfig: true,
       canUseTool,
       onUserDialog,
       supportedDialogKinds: [...supportedDialogKinds],
@@ -814,7 +826,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     if (this.options.permissionHandler) {
       this.emit({ type: 'permission_requested', request })
       try {
-        const decision = permissionDecisionForSdk(await this.options.permissionHandler(request))
+        const decision = permissionDecisionForSdk(await this.options.permissionHandler(request), input)
         this.emit({ type: 'permission_resolved', requestId: request.requestId, decision: claudePermissionDecision(decision) })
         return decision
       } catch (error) {
@@ -823,7 +835,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     }
     if (this.options.defaultPermission !== undefined) {
       this.emit({ type: 'permission_requested', request })
-      const decision = this.options.defaultPermission
+      const decision = permissionDecisionForSdk(this.options.defaultPermission, input)
       this.emit({ type: 'permission_resolved', requestId: request.requestId, decision: claudePermissionDecision(decision) })
       return decision
     }
@@ -833,12 +845,12 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     this.emit({ type: 'permission_requested', request })
     try {
       const response = await responsePromise
-      return toSdkPermissionResult(response)
+      return permissionDecisionForSdk(toSdkPermissionResult(response), input)
     } catch (error) {
       if (error instanceof ControlError && (error.code === 'timeout' || error.code === 'canceled')) {
         const decision: ClaudePermissionDecision = { behavior: 'deny', message: error.message, interrupt: error.code === 'canceled', ...(request.toolUseId === undefined ? {} : { toolUseID: request.toolUseId }) }
         this.emit({ type: 'permission_resolved', requestId: request.requestId, decision })
-        return permissionDecisionForSdk(decision)
+        return permissionDecisionForSdk(decision, input)
       }
       throw this.redactor.redactError(error)
     }
@@ -967,6 +979,12 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
       this.emitSessionStarted()
     } else if (subtype === 'compact_boundary') {
       this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'compaction', text: this.redactor.redact(stringValue(message['compact_metadata']) ?? ''), metadata: this.redactor.redactValue(message) } })
+    } else if (subtype === 'local_command_output') {
+      const text = stringValue(message['content']) ?? ''
+      if (text.length > 0) {
+        if (this.activeTurn) this.activeTurn.finalText += text
+        this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'assistant_message', text } })
+      }
     } else this.emit({ type: 'status_changed', status: subtype ?? 'system', metadata: this.redactor.redactValue(message) })
   }
 
@@ -1002,7 +1020,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     const index = String(event?.['index'] ?? '')
     if (eventType === 'content_block_start') {
       const block = asRecord(event?.['content_block'])
-      if (stringValue(block?.['type']) === 'tool_use') {
+      if (isToolUseBlockType(block?.['type'])) {
         const id = stringValue(block?.['id'])
         const name = stringValue(block?.['name'])
         if (id && name) this.toolMetaByIndex.set(index, { id, name })
@@ -1031,6 +1049,20 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     }
   }
 
+  private emitToolResult(block: Record<string, unknown>, fallbackId?: string): void {
+    const blockContent = block['content'] ?? block['output'] ?? block['result']
+    this.emit({
+      type: 'timeline',
+      turnId: this.activeTurn?.id,
+      item: {
+        type: 'tool_result',
+        id: stringValue(block['tool_use_id']) ?? stringValue(block['toolUseId']) ?? fallbackId,
+        output: contentText(blockContent),
+        isError: boolValue(block['is_error']) ?? boolValue(block['isError']) ?? false,
+      },
+    })
+  }
+
   private handleAssistant(message: Record<string, unknown>): void {
     const content = asRecord(message['message'])?.['content']
     if (!Array.isArray(content)) return
@@ -1049,22 +1081,37 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
         case 'redacted_thinking':
           this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'reasoning', text: stringValue(block['thinking']) ?? '', metadata: block } })
           break
-        case 'tool_use': {
+        case 'tool_use':
+        case 'mcp_tool_use':
+        case 'server_tool_use': {
           const id = stringValue(block['id']) ?? randomUUID()
           this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'tool_call', id, name: stringValue(block['name']), arguments: serialize(block['input']), parentToolUseId: stringValue(message['parent_tool_use_id']) ?? null } })
           break
         }
+        case 'tool_result':
+        case 'mcp_tool_result':
+        case 'server_tool_result':
+          this.emitToolResult(block)
+          break
       }
     }
   }
 
   private handleUser(message: Record<string, unknown>): void {
     const content = asRecord(message['message'])?.['content']
-    if (!Array.isArray(content)) return
-    for (const rawBlock of content) {
-      const block = asRecord(rawBlock)
-      if (block?.['type'] !== 'tool_result') continue
-      this.emit({ type: 'timeline', turnId: this.activeTurn?.id, item: { type: 'tool_result', id: stringValue(block['tool_use_id']), output: contentText(block['content']), isError: boolValue(block['is_error']) ?? false } })
+    if (Array.isArray(content)) {
+      let emittedResult = false
+      for (const rawBlock of content) {
+        const block = asRecord(rawBlock)
+        if (block === undefined || !isToolResultBlockType(block['type'])) continue
+        emittedResult = true
+        this.emitToolResult(block)
+      }
+      if (emittedResult) return
+    }
+    const toolUseResult = message['tool_use_result'] ?? message['toolUseResult']
+    if (toolUseResult !== undefined) {
+      this.emitToolResult(asRecord(toolUseResult) ?? { content: toolUseResult }, stringValue(message['tool_use_id']) ?? stringValue(message['toolUseId']))
     }
   }
 

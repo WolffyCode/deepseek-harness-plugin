@@ -94,6 +94,7 @@ export declare class ClaudeProviderSession implements ClaudeAgentSession {
     private emitSessionStarted;
     private applyInitialization;
     private handleStreamEvent;
+    private emitToolResult;
     private handleAssistant;
     private handleUser;
     private handleResult;

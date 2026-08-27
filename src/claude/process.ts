@@ -48,9 +48,10 @@ function killProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.S
 /**
  * Owns the Claude CLI child used by the SDK bridge.
  *
- * The SDK passes a complete environment to custom spawners. It is intentionally
- * copied as-is rather than merged with the host environment, so credentials or
- * provider settings from the parent shell cannot leak into the Claude process.
+ * The SDK supplies the child environment explicitly. It is copied without
+ * merging the host environment, except for the host executable search path when
+ * the SDK did not provide one; credentials and provider settings never leak from
+ * the parent shell into the Claude process.
  */
 export class ClaudeProcess implements SpawnedProcess {
   private readonly child: ChildProcessWithoutNullStreams
@@ -68,9 +69,14 @@ export class ClaudeProcess implements SpawnedProcess {
     this.redactions = [...options.redactions ?? []].filter(secret => secret.length > 0)
     this.abortSignal = options.signal
     this.abortHandler = () => { this.kill('SIGTERM') }
+    const env = { ...options.env }
+    if (env['PATH'] === undefined && env['Path'] === undefined) {
+      const inheritedPath = process.env['PATH'] ?? process.env['Path']
+      if (inheritedPath !== undefined) env[process.platform === 'win32' ? 'Path' : 'PATH'] = inheritedPath
+    }
     this.child = spawn(options.command, [...options.args], {
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      env: { ...options.env },
+      env,
       shell: false,
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],

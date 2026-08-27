@@ -32,6 +32,7 @@ interface TurnObservation {
   readonly mcpToolCall: boolean
   readonly mcpToolResult: boolean
   readonly permissionResolved: boolean
+  readonly events: readonly ClaudeAdapterEvent[]
 }
 
 function firstEnv(...names: string[]): string | undefined {
@@ -81,6 +82,21 @@ function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): 
       reject(error)
     })
   })
+}
+
+interface McpAuditEntry {
+  readonly method: string
+  readonly name?: string
+  readonly text?: string
+}
+
+async function readAudit(path: string): Promise<readonly McpAuditEntry[]> {
+  try {
+    const contents = await readFile(path, 'utf8')
+    return contents.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as McpAuditEntry)
+  } catch {
+    return []
+  }
 }
 
 async function containsSecret(root: string, secret: string): Promise<boolean> {
@@ -250,7 +266,9 @@ async function runTurn(session: ClaudeAgentSession, prompt: string): Promise<Tur
   let mcpToolCall = false
   let mcpToolResult = false
   let permissionResolved = false
+  const events: ClaudeAdapterEvent[] = []
   const off = session.subscribe((event: ClaudeAdapterEvent) => {
+    events.push(event)
     if (event.type === 'timeline' && event.item.type === 'assistant_message' && event.item.partial === true && (event.item.text?.length ?? 0) > 0) firstToken = true
     if (event.type === 'timeline' && event.item.type === 'tool_call' && event.item.name?.includes('asset_echo')) mcpToolCall = true
     if (event.type === 'timeline' && event.item.type === 'tool_result' && event.item.output?.includes(MCP_RESULT)) mcpToolResult = true
@@ -258,7 +276,7 @@ async function runTurn(session: ClaudeAgentSession, prompt: string): Promise<Tur
   })
   try {
     const result = await withTimeout(session.run(prompt), 'Claude assets turn', TURN_TIMEOUT_MS)
-    return { finalText: result.finalText, firstToken, mcpToolCall, mcpToolResult, permissionResolved }
+    return { finalText: result.finalText, firstToken, mcpToolCall, mcpToolResult, permissionResolved, events }
   } finally {
     off()
   }
@@ -295,16 +313,14 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
   const cwd = join(root, 'cwd')
   const configDir = join(root, 'claude-config')
   const pluginDir = join(root, 'plugin')
-  const skillDir = join(pluginDir, 'skills', SKILL_NAME)
   const mcpServerPath = join(root, 'mcp-server.mjs')
   const auditPath = join(root, 'mcp-audit.jsonl')
   await mkdir(cwd, { recursive: true })
   await mkdir(configDir, { recursive: true })
   await mkdir(join(pluginDir, '.claude-plugin'), { recursive: true })
-  await mkdir(skillDir, { recursive: true })
   await writeFile(mcpServerPath, MCP_SERVER_SOURCE, 'utf8')
   await writeFile(join(pluginDir, '.claude-plugin', 'plugin.json'), PLUGIN_MANIFEST, 'utf8')
-  await writeFile(join(skillDir, 'SKILL.md'), SKILL_SOURCE, 'utf8')
+  await writeFile(join(pluginDir, 'SKILL.md'), SKILL_SOURCE, 'utf8')
 
   let session: ClaudeAgentSession | undefined
   try {
@@ -317,13 +333,14 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     assert.ok(catalog.commands.some(command => command.name === SKILL_NAME), `local skill command ${SKILL_NAME} was not returned by supportedCommands()`)
 
     const mcpTurn = await runTurn(session, `Use the local MCP server asset-fixture. Call its asset_echo tool exactly once with the text ${MCP_INPUT}. Do not use any other tool. After the tool returns, reply with exactly ${MCP_RESPONSE}.`)
-    assert.equal(mcpTurn.firstToken, true, 'MCP turn did not emit a partial assistant token')
-    assert.equal(mcpTurn.mcpToolCall, true, 'the model did not call the fixture MCP tool')
-    assert.equal(mcpTurn.mcpToolResult, true, 'the fixture MCP tool result was not observed')
-    assert.equal(mcpTurn.permissionResolved, true, 'the fixture MCP permission was not resolved')
-    assert.equal(mcpTurn.finalText.includes(MCP_RESPONSE), true, 'the final response did not contain the fixture MCP result marker')
+    const auditEntries = await readAudit(auditPath)
+    const diagnostics = `finalText=${JSON.stringify(mcpTurn.finalText)} events=${JSON.stringify(mcpTurn.events)} audit=${JSON.stringify(auditEntries)}`
+    assert.equal(mcpTurn.firstToken, true, `MCP turn did not emit a partial assistant token; ${diagnostics}`)
+    assert.equal(mcpTurn.mcpToolCall, true, `the model did not call the fixture MCP tool; ${diagnostics}`)
+    assert.equal(mcpTurn.mcpToolResult, true, `the fixture MCP tool result was not observed; ${diagnostics}`)
+    assert.equal(mcpTurn.permissionResolved, true, `the fixture MCP permission was not resolved; ${diagnostics}`)
+    assert.equal(mcpTurn.finalText.includes(MCP_RESPONSE), true, `the final response did not contain the fixture MCP result marker; ${diagnostics}`)
 
-    const auditEntries = (await readFile(auditPath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as { method: string; name?: string; text?: string })
     const methods = auditEntries.map(entry => entry.method)
     assert.equal(methods.includes('initialize'), true, 'fixture MCP server did not receive initialize')
     assert.equal(methods.includes('tools/list'), true, 'fixture MCP server did not receive tools/list')
@@ -332,8 +349,9 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     assert.equal(calls.length, 1, 'fixture MCP tool was not called exactly once')
     assert.deepEqual(calls[0], { method: 'tools/call', name: 'asset_echo', text: MCP_INPUT })
 
-    const skillTurn = await runTurn(session, `Invoke /${SKILL_NAME} and follow the local skill instructions. Do not call any tool.`)
-    assert.equal(skillTurn.finalText.includes(SKILL_RESPONSE), true, 'the model did not load and follow the local Skill command')
+    const skillTurn = await runTurn(session, `/${SKILL_NAME}`)
+    const skillDiagnostics = `finalText=${JSON.stringify(skillTurn.finalText)} events=${JSON.stringify(skillTurn.events)}`
+    assert.equal(skillTurn.finalText.includes(SKILL_RESPONSE), true, `the model did not load and follow the local Skill command; ${skillDiagnostics}`)
 
     await session.close()
     await session.close()
