@@ -281,6 +281,49 @@ test('ClaudeProviderSession supplies original tool input for every SDK allow pat
   }
 })
 
+test('ClaudeProviderSession denies malformed allow updatedInput instead of executing original input', async () => {
+  let handlerQuery!: FakeQuery
+  const handlerSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    permissionHandler: async () => ({ behavior: 'allow', updatedInput: ['unsafe'] } as unknown as { behavior: 'allow'; updatedInput: Record<string, unknown> }),
+    queryFactory: ({ options }) => {
+      handlerQuery = new FakeQuery(options)
+      return handlerQuery as unknown as Query
+    },
+  })
+  let interactiveQuery!: FakeQuery
+  const interactiveSession = createClaudeProviderSession({
+    cwd: process.cwd(),
+    queryFactory: ({ options }) => {
+      interactiveQuery = new FakeQuery(options)
+      return interactiveQuery as unknown as Query
+    },
+  })
+  interactiveSession.subscribe(event => {
+    if (event.type === 'permission_requested') {
+      assert.equal(interactiveSession.respondToPermission(event.request.requestId, { behavior: 'allow', updatedInput: ['unsafe'] } as unknown as { behavior: 'allow'; updatedInput: Record<string, unknown> }), true)
+    }
+  })
+  const expected = {
+    behavior: 'deny' as const,
+    message: 'Claude permission allow decision has invalid updatedInput; tool execution was denied',
+  }
+  try {
+    const request = {
+      requestId: 'malformed-updated-input',
+      toolUseID: 'malformed-tool',
+      signal: new AbortController().signal,
+    }
+    const handlerResult = await handlerQuery.options.canUseTool!('Bash', { command: 'safe-looking-input' }, request)
+    const interactiveResult = await interactiveQuery.options.canUseTool!('Bash', { command: 'safe-looking-input' }, { ...request, requestId: 'malformed-interactive-input' })
+    assert.deepEqual(handlerResult, expected)
+    assert.deepEqual(interactiveResult, expected)
+  } finally {
+    await handlerSession.close()
+    await interactiveSession.close()
+  }
+})
+
 test('ClaudeProviderSession handles failure and cancellation without leaking active turns', async () => {
   let query!: FakeQuery
   const session = createClaudeProviderSession({ cwd: process.cwd(), queryFactory: ({ options }) => { query = new FakeQuery(options); return query as unknown as Query } })

@@ -21,6 +21,8 @@ import { createEngineSuiteRuntime } from '../src/engine-suite.js'
 type CatalogModel = {
   readonly id: string
   readonly value?: string
+  readonly name?: string
+  readonly model?: string
   readonly displayName?: string
   readonly resolvedModel?: string
 }
@@ -125,6 +127,8 @@ test('filters every Opus field from supportedModels without mutating input', asy
     { id: 'opus-value', value: 'claude-opus' },
     { id: 'opus-display', displayName: 'Claude OPUS' },
     { id: 'opus-resolved', resolvedModel: 'claude-3-opus-latest' },
+    { id: 'opus-name', name: 'claude-opus-name' },
+    { id: 'opus-model', model: 'claude-opus-model' },
     { id: 'sonnet', value: 'claude-sonnet', displayName: 'Claude Sonnet' },
   ]
   const before = structuredClone(models)
@@ -138,7 +142,7 @@ test('filters every Opus field from supportedModels without mutating input', asy
 
   assert.deepEqual(session.catalog.models.map(model => model.id), ['sonnet'])
   assert.deepEqual(models, before)
-  assert.deepEqual(filterClaudeCatalogModels(models), [models[3]])
+  assert.deepEqual(filterClaudeCatalogModels(models), [models[5]])
   await session.close()
 })
 

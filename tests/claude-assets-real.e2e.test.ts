@@ -31,7 +31,9 @@ interface TurnObservation {
   readonly firstToken: boolean
   readonly mcpToolCall: boolean
   readonly mcpToolResult: boolean
+  readonly permissionRequested: boolean
   readonly permissionResolved: boolean
+  readonly permissionTools: readonly string[]
   readonly events: readonly ClaudeAdapterEvent[]
 }
 
@@ -91,12 +93,10 @@ interface McpAuditEntry {
 }
 
 async function readAudit(path: string): Promise<readonly McpAuditEntry[]> {
-  try {
-    const contents = await readFile(path, 'utf8')
-    return contents.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as McpAuditEntry)
-  } catch {
-    return []
-  }
+  const contents = await readFile(path, 'utf8')
+  const trimmed = contents.trim()
+  if (trimmed.length === 0) return []
+  return trimmed.split('\n').map(line => JSON.parse(line) as McpAuditEntry)
 }
 
 async function containsSecret(root: string, secret: string): Promise<boolean> {
@@ -232,7 +232,7 @@ function createSession(
 ): ClaudeAgentSession {
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => sdkQuery({ prompt, options })
   const permissionHandler = async (request: Parameters<NonNullable<Parameters<typeof createClaudeProviderSession>[0]['permissionHandler']>>[0]): Promise<ClaudePermissionHandlerResult> => {
-    if (request.toolName === 'Skill' || request.toolName.startsWith('mcp__')) return { behavior: 'allow' }
+    if (request.toolName === 'Skill' || request.toolName === 'mcp__asset-fixture__asset_echo') return { behavior: 'allow' }
     return { behavior: 'deny', message: 'The assets E2E permits only Skill and the fixture MCP tool.' }
   }
   return createClaudeProviderSession({
@@ -265,18 +265,33 @@ async function runTurn(session: ClaudeAgentSession, prompt: string): Promise<Tur
   let firstToken = false
   let mcpToolCall = false
   let mcpToolResult = false
-  let permissionResolved = false
+  const permissionRequestTools = new Map<string, string>()
+  const permissionDecisions = new Map<string, 'allow' | 'deny' | 'unknown'>()
   const events: ClaudeAdapterEvent[] = []
   const off = session.subscribe((event: ClaudeAdapterEvent) => {
     events.push(event)
     if (event.type === 'timeline' && event.item.type === 'assistant_message' && event.item.partial === true && (event.item.text?.length ?? 0) > 0) firstToken = true
     if (event.type === 'timeline' && event.item.type === 'tool_call' && event.item.name?.includes('asset_echo')) mcpToolCall = true
     if (event.type === 'timeline' && event.item.type === 'tool_result' && event.item.output?.includes(MCP_RESULT)) mcpToolResult = true
-    if (event.type === 'permission_resolved') permissionResolved = true
+    if (event.type === 'permission_requested') permissionRequestTools.set(event.request.requestId, event.request.toolName)
+    if (event.type === 'permission_resolved') permissionDecisions.set(event.requestId, event.decision.behavior === 'allow' ? 'allow' : event.decision.behavior === 'deny' ? 'deny' : 'unknown')
   })
   try {
     const result = await withTimeout(session.run(prompt), 'Claude assets turn', TURN_TIMEOUT_MS)
-    return { finalText: result.finalText, firstToken, mcpToolCall, mcpToolResult, permissionResolved, events }
+    const permissionIds = [...permissionRequestTools.keys()]
+    const permissionResolved = permissionIds.length > 0
+      && permissionIds.every(requestId => permissionDecisions.get(requestId) === 'allow')
+      && session.pendingPermissions().length === 0
+    return {
+      finalText: result.finalText,
+      firstToken,
+      mcpToolCall,
+      mcpToolResult,
+      permissionRequested: permissionIds.length > 0,
+      permissionResolved,
+      permissionTools: [...permissionRequestTools.values()],
+      events,
+    }
   } finally {
     off()
   }
@@ -284,7 +299,7 @@ async function runTurn(session: ClaudeAgentSession, prompt: string): Promise<Tur
 
 const preflight = readConfig()
 
-test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: preflight.skip }, async t => {
+test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: preflight.skip }, async () => {
   if (preflight.reject) throw new Error(preflight.reject)
   const config = preflight.config
   assert.ok(config)
@@ -294,10 +309,6 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 10_000,
   })
-  if (cli.error?.message.includes('ENOENT')) {
-    t.skip('missing local Claude executable')
-    return
-  }
   if (cli.error) throw new Error(`local Claude CLI precondition failed: ${safeError(cli.error, config.authToken)}`)
   if (cli.status !== 0) throw new Error(`local Claude CLI precondition failed: exit ${cli.status ?? 'unknown'}`)
 
@@ -313,14 +324,16 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
   const cwd = join(root, 'cwd')
   const configDir = join(root, 'claude-config')
   const pluginDir = join(root, 'plugin')
+  const skillDir = join(pluginDir, 'skills', SKILL_NAME)
   const mcpServerPath = join(root, 'mcp-server.mjs')
   const auditPath = join(root, 'mcp-audit.jsonl')
   await mkdir(cwd, { recursive: true })
   await mkdir(configDir, { recursive: true })
   await mkdir(join(pluginDir, '.claude-plugin'), { recursive: true })
+  await mkdir(skillDir, { recursive: true })
   await writeFile(mcpServerPath, MCP_SERVER_SOURCE, 'utf8')
   await writeFile(join(pluginDir, '.claude-plugin', 'plugin.json'), PLUGIN_MANIFEST, 'utf8')
-  await writeFile(join(pluginDir, 'SKILL.md'), SKILL_SOURCE, 'utf8')
+  await writeFile(join(skillDir, 'SKILL.md'), SKILL_SOURCE, 'utf8')
 
   let session: ClaudeAgentSession | undefined
   try {
@@ -338,7 +351,9 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     assert.equal(mcpTurn.firstToken, true, `MCP turn did not emit a partial assistant token; ${diagnostics}`)
     assert.equal(mcpTurn.mcpToolCall, true, `the model did not call the fixture MCP tool; ${diagnostics}`)
     assert.equal(mcpTurn.mcpToolResult, true, `the fixture MCP tool result was not observed; ${diagnostics}`)
-    assert.equal(mcpTurn.permissionResolved, true, `the fixture MCP permission was not resolved; ${diagnostics}`)
+    assert.equal(mcpTurn.permissionRequested, true, `the fixture MCP permission callback was not requested; ${diagnostics}`)
+    assert.deepEqual(mcpTurn.permissionTools, ['mcp__asset-fixture__asset_echo'], `an unexpected permission target was observed; ${diagnostics}`)
+    assert.equal(mcpTurn.permissionResolved, true, `the fixture MCP permission was not resolved as allow; ${diagnostics}`)
     assert.equal(mcpTurn.finalText.includes(MCP_RESPONSE), true, `the final response did not contain the fixture MCP result marker; ${diagnostics}`)
 
     const methods = auditEntries.map(entry => entry.method)

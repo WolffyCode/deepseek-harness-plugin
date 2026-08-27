@@ -84,7 +84,7 @@ export function isOpusModel(value: unknown): boolean {
   if (typeof value === 'string') return value.toLowerCase().includes('opus')
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
-  return ['value', 'displayName', 'resolvedModel'].some(key => isOpusModel(record[key]))
+  return ['value', 'id', 'name', 'model', 'displayName', 'resolvedModel'].some(key => isOpusModel(record[key]))
 }
 
 /** Filters every Claude SDK catalog row whose alias, label, or resolved model is Opus. */
@@ -200,7 +200,10 @@ function normalizeSdkModel(value: unknown): SdkModelInfo | undefined {
 }
 function permissionDecisionForSdk(decision: ClaudePermissionHandlerResult, originalInput: Record<string, unknown>): PermissionResult {
   if (decision.behavior === 'deny') return decision
-  const updatedInput = decision.updatedInput === undefined ? originalInput : asRecord(decision.updatedInput) ?? originalInput
+  const updatedInput = decision.updatedInput === undefined ? originalInput : asRecord(decision.updatedInput)
+  if (updatedInput === undefined) {
+    return { behavior: 'deny', message: 'Claude permission allow decision has invalid updatedInput; tool execution was denied' }
+  }
   return {
     behavior: 'allow',
     updatedInput,
@@ -220,7 +223,10 @@ function controlPermissionResponse(decision: ClaudePermissionDecision): ControlP
       ...(decision.decisionClassification === undefined ? {} : { decisionClassification: decision.decisionClassification }),
     }
   }
-  const updatedInput = asRecord(decision.updatedInput)
+  const updatedInput = decision.updatedInput === undefined ? undefined : asRecord(decision.updatedInput)
+  if (decision.updatedInput !== undefined && updatedInput === undefined) {
+    return { behavior: 'deny', message: 'Claude permission allow decision has invalid updatedInput; tool execution was denied' }
+  }
   return {
     behavior: 'allow',
     ...(updatedInput === undefined ? {} : { updatedInput }),
@@ -252,6 +258,10 @@ function claudePermissionDecision(decision: PermissionResult): ClaudePermissionD
     ...(decision.toolUseID === undefined ? {} : { toolUseID: decision.toolUseID }),
     ...(decision.decisionClassification === undefined ? {} : { decisionClassification: decision.decisionClassification }),
   }
+}
+
+function claudeControlPermissionDecision(decision: ControlPermissionResponse): ClaudePermissionDecision {
+  return claudePermissionDecision(toSdkPermissionResult(decision))
 }
 
 export function parseClaudeUserAgentDefinitions(value: unknown): Record<string, AgentDefinition> | undefined {
@@ -465,7 +475,7 @@ export class ClaudeProviderSession implements ClaudeAgentSession {
     const response = controlPermissionResponse(decision)
     const outcome = this.permissionRegistry.respond(requestId, response)
     if (!outcome.ok) return false
-    this.emit({ type: 'permission_resolved', requestId, decision })
+    this.emit({ type: 'permission_resolved', requestId, decision: claudeControlPermissionDecision(response) })
     return true
   }
 
