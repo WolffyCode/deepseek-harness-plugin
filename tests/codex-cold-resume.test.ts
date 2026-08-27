@@ -53,7 +53,7 @@ test('Codex custom executable and args survive a service cold resume', async () 
   const args = ['-e', serverScript(), marker, 'COLD_EXECUTABLE_ARGS_OK']
   const { suite, selection } = registerSuite()
   const firstContext = await context()
-  const firstService = new EngineSuiteAgentService(firstContext, suite, () => 'cold-provider-secret', Promise.resolve(), bindings)
+  const firstService = new EngineSuiteAgentService(firstContext, suite, () => 'cold-provider-secret', bindings)
   const first = await firstService.createCodex({
     sessionId: 'cold-session',
     selection,
@@ -85,7 +85,7 @@ test('Codex custom executable and args survive a service cold resume', async () 
       }
     },
   })
-  const secondService = new EngineSuiteAgentService(secondContext, suite, () => 'cold-provider-secret', Promise.resolve(), bindings)
+  const secondService = new EngineSuiteAgentService(secondContext, suite, () => 'cold-provider-secret', bindings)
   const resumed = await secondService.resume(secondContext, { resumeSessionId: SessionId('cold-session') })
   try {
     assert.equal(resumed.session, persistedSession)

@@ -4,10 +4,7 @@ import { EngineSuiteAgentService } from './agent/service.js';
 import { EngineSuiteGateway } from './remote.js';
 /** One installed bundle entry; child capabilities are owned by this plugin. */
 export declare const inject: string[];
-export interface EngineSuitePluginConfig {
-    readonly primary?: boolean;
-}
-export declare function apply(ctx: Context, config?: EngineSuitePluginConfig): void;
+export declare function apply(ctx: Context): void;
 export interface EngineSuiteService extends EngineSuite {
 }
 export interface EngineSuiteRuntimeService extends EngineSuiteService {

@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
-import { type AgentFactory, type AgentHandle, type CreateAgentOptions, type ResumeAgentOptions } from '@deepseek-ai/dsh-agent';
+import { type Agent, type AgentFactory, type AgentHandle, type CreateAgentOptions, type ResumeAgentOptions } from '@deepseek-ai/dsh-agent';
 import { type Session } from '@deepseek-ai/dsh-session';
 import type { EngineSuiteRuntime } from '../engine-suite.js';
 import type { EngineSelection } from '../profile/types.js';
@@ -7,6 +7,10 @@ import type { EngineProfileId } from '../profile/types.js';
 import { ExternalEngineBindingStore } from '../engine/bindings.js';
 import type { EngineSuiteCommandView } from '../types.js';
 import { type ParentChildLineageDescriptor, type ParentChildLineageEvent, type ParentChildLineageStore } from '../orchestration/lineage.js';
+export interface HostAgentHandleStore {
+    wait(sessionId: string, agent: Agent): Promise<AgentHandle | undefined>;
+    take(sessionId: string, agent: Agent): AgentHandle | undefined;
+}
 export interface CreateExternalAgentOptions {
     readonly sessionId: string;
     readonly selection: EngineSelection;
@@ -39,14 +43,14 @@ export interface EngineSuiteAgentHandle extends AgentHandle {
 }
 /**
  * Creates and registers external Engine Agents without replacing Harness core
- * services. The optional primary factory is used only when this plugin is
- * explicitly configured as the AgentFactory owner.
+ * services. Harness owns native Session creation; this service is entered only
+ * by an explicit external-engine selection or child delegation.
  */
 export declare class EngineSuiteAgentService implements AgentFactory {
     private readonly ctx;
     private readonly suite;
     private readonly resolveApiKey;
-    private readonly catalogReady;
+    private readonly hostAgentHandles?;
     private readonly live;
     private readonly children;
     private readonly bindings;
@@ -55,7 +59,8 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     private readonly lineageStore;
     private readonly closedSessions;
     private readonly childReservations;
-    constructor(ctx: Context, suite: EngineSuiteRuntime, resolveApiKey: (credentialRef: string) => string | Promise<string>, catalogReady?: Promise<void>, bindings?: ExternalEngineBindingStore, lineageStore?: ParentChildLineageStore);
+    private readonly sessionOperations;
+    constructor(ctx: Context, suite: EngineSuiteRuntime, resolveApiKey: (credentialRef: string) => string | Promise<string>, bindings?: ExternalEngineBindingStore, lineageStore?: ParentChildLineageStore, hostAgentHandles?: HostAgentHandleStore | undefined);
     createExternal(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;
     createCodex(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle>;
     switchExternal(sessionId: string, selection: EngineSelection, apiKey: string): Promise<EngineSuiteAgentHandle>;
@@ -66,7 +71,7 @@ export declare class EngineSuiteAgentService implements AgentFactory {
         readonly text: string;
         readonly lineage: ParentChildLineageDescriptor;
     }>;
-    /** AgentRegistry factory entry used by session.create when Engine Suite is primary. */
+    /** Optional AgentFactory entry for embedders that explicitly choose Engine Suite ownership. */
     createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle>;
     /** Cold resume invoked by Harness API Remote lookup after a process restart. */
     resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<EngineSuiteAgentHandle>;
@@ -83,6 +88,8 @@ export declare class EngineSuiteAgentService implements AgentFactory {
     private delegateNative;
     private delegateFromBridge;
     private defaultSelection;
+    private findLiveSession;
+    private withSessionOperation;
     private createExternalOn;
     private observeChildRuntimeEvent;
     private attachWorkspace;

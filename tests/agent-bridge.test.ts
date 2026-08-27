@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry, { type AgentHandle } from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { type Agent, type AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import test from 'node:test'
 import { apply } from '../src/index.js'
 import type { EngineSuiteRuntimeService } from '../src/plugin.js'
 import { EngineSuiteChildBridge } from '../src/orchestration/bridge.js'
+import { ExternalEngineBindingStore } from '../src/engine/bindings.js'
+import { createEngineSuiteRuntime } from '../src/engine-suite.js'
+import { EngineSuiteAgentService, type HostAgentHandleStore } from '../src/agent/service.js'
 
 function fakeCodexServer(): string {
   return [
@@ -17,6 +23,25 @@ function fakeCodexServer(): string {
     "else if(m.method==='thread/resume') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{thread:{id:m.params.threadId,ephemeral:false}}})+'\\n');",
     "else if(m.method==='turn/start'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{turn:{id:'fixture-turn'}}})+'\\n'); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'item/agentMessage/delta',params:{turnId:'fixture-turn',delta:'fixture answer ' + (m.params?.model ?? 'unknown')}})+'\\n'),10); setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{turn:{id:'fixture-turn',status:'completed'}}})+'\\n'),20);}",
     "});",
+  ].join('')
+}
+
+function countingCodexServer(auditPath: string): string {
+  return [
+    "const fs=require('node:fs');",
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    `const audit=${JSON.stringify(auditPath)};`,
+    "rl.on('line',line=>{const m=JSON.parse(line);",
+    "if(m.method==='initialize'){fs.appendFileSync(audit,'initialize\\n'); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n');}",
+    "else if(m.method==='thread/start') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{thread:{id:'counted-thread',ephemeral:false}}})+'\\n');",
+    "});",
+  ].join('')
+}
+
+function failingCodexServer(): string {
+  return [
+    "const rl=require('node:readline').createInterface({input:process.stdin});",
+    "rl.on('line',line=>{const m=JSON.parse(line); if(m.method==='initialize'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{ok:true}})+'\\n'); setTimeout(()=>process.exit(1),5);}});",
   ].join('')
 }
 
@@ -277,6 +302,155 @@ test('EngineSuite delegates an authorized child Agent across Engine Profiles wit
     await result.handle.dispose()
   } finally {
     await parent.dispose()
+  }
+})
+
+test('EngineSuite serializes concurrent external creation for one Session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-create-'))
+  const auditPath = join(root, 'launches.log')
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  apply(ctx)
+  const suite = ctx.get('engineSuite') as EngineSuiteRuntimeService
+  suite.providers.register({ id: 'duplicate-provider', engineId: 'codex-cli', name: 'Duplicate Provider', baseUri: 'https://example.test', credentialRef: 'duplicate-credential' })
+  suite.models.register({ id: 'duplicate-model', engineId: 'codex-cli', providerId: 'duplicate-provider', modelId: 'duplicate-model', reasoningOptions: [{ id: 'xhigh' }], source: 'manual' })
+  const options = {
+    sessionId: 'duplicate-session',
+    selection: { engineId: 'codex-cli', providerId: 'duplicate-provider', modelRecordId: 'duplicate-model', reasoningEffort: 'xhigh' },
+    apiKey: 'duplicate-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', countingCodexServer(auditPath)],
+  } as const
+  const [first, second] = await Promise.all([suite.agents.createExternal(options), suite.agents.createExternal(options)])
+  try {
+    assert.equal(first, second)
+    assert.equal(first.selection.engineId, 'codex-cli')
+    assert.equal(first.selection.providerId, 'duplicate-provider')
+    assert.equal(first.selection.modelRecordId, 'duplicate-model')
+    assert.equal(first.selection.reasoningEffort, 'xhigh')
+    const header = first.session.requestHeader()
+    assert.equal(header?.config.provider, 'duplicate-provider')
+    assert.equal(header?.config.model, 'duplicate-model')
+    assert.equal(header?.config.reasoningEffort, 'xhigh')
+    assert.equal(suite.agents.list().length, 1)
+    assert.equal((await readFile(auditPath, 'utf8')).trim().split('\n').filter(Boolean).length, 1)
+  } finally {
+    await first.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('failed external startup leaves no Session, Agent, Engine handle, or binding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-startup-failure-'))
+  const bindingFile = join(root, 'engine-bindings.json')
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  const suite = createEngineSuiteRuntime()
+  suite.providers.register({ id: 'failure-provider', engineId: 'codex-cli', name: 'Failure Provider', baseUri: 'https://example.test', credentialRef: 'failure-credential' })
+  suite.models.register({ id: 'failure-model', engineId: 'codex-cli', providerId: 'failure-provider', modelId: 'failure-model', reasoningOptions: [{ id: 'low' }], source: 'manual' })
+  const service = new EngineSuiteAgentService(ctx, suite, () => 'failure-secret', new ExternalEngineBindingStore(bindingFile))
+  try {
+    await assert.rejects(service.createExternal({
+      sessionId: 'startup-failure',
+      selection: { engineId: 'codex-cli', providerId: 'failure-provider', modelRecordId: 'failure-model', reasoningEffort: 'low' },
+      apiKey: 'failure-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', failingCodexServer()], startupTimeoutMs: 100,
+    }), /closed|exit|failed|startup/u)
+    assert.equal(service.list().length, 0)
+    assert.equal(ctx.agents.get(SessionId('startup-failure')), undefined)
+    assert.equal(ctx.sessions.get(SessionId('startup-failure')), undefined)
+    assert.equal(await new ExternalEngineBindingStore(bindingFile).get('startup-failure'), undefined)
+    await assert.rejects(readFile(bindingFile), { code: 'ENOENT' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('external publication failure after workspace attach rolls back every owned resource', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-attach-failure-'))
+  const bindingFile = join(root, 'engine-bindings.json')
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  ctx.provide('workspaceRegistry', {
+    list: () => [{
+      path: process.cwd(),
+      attachSession: async () => { throw new Error('workspace attach failed') },
+    }],
+  } as never)
+  const suite = createEngineSuiteRuntime()
+  suite.providers.register({ id: 'attach-failure-provider', engineId: 'codex-cli', name: 'Attach Failure Provider', baseUri: 'https://example.test', credentialRef: 'attach-failure-credential' })
+  suite.models.register({ id: 'attach-failure-model', engineId: 'codex-cli', providerId: 'attach-failure-provider', modelId: 'attach-failure-model', reasoningOptions: [{ id: 'low' }], source: 'manual' })
+  const service = new EngineSuiteAgentService(ctx, suite, () => 'attach-failure-secret', new ExternalEngineBindingStore(bindingFile))
+  try {
+    await assert.rejects(service.createExternal({
+      sessionId: 'attach-failure',
+      selection: { engineId: 'codex-cli', providerId: 'attach-failure-provider', modelRecordId: 'attach-failure-model', reasoningEffort: 'low' },
+      apiKey: 'attach-failure-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', fakeCodexServer()],
+    }), /workspace attach failed/u)
+    assert.equal(service.list().length, 0)
+    assert.equal(ctx.agents.get(SessionId('attach-failure')), undefined)
+    assert.equal(ctx.sessions.get(SessionId('attach-failure')), undefined)
+    assert.equal(await new ExternalEngineBindingStore(bindingFile).get('attach-failure'), undefined)
+    await assert.rejects(readFile(bindingFile), { code: 'ENOENT' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('external selection promotes a blank Host-native Agent without duplicating its Session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-promotion-'))
+  const bindingFile = join(root, 'engine-bindings.json')
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(AgentRegistry)
+  const sessions = ctx.get('sessions')
+  const agents = ctx.get('agents')
+  assert.ok(sessions !== undefined)
+  assert.ok(agents !== undefined)
+  const sessionId = SessionId('native-promotion')
+  const session = sessions.prepare(sessionId, { meta: { cwd: process.cwd() } })
+  const nativeAgent = { id: sessionId, session } as Agent
+  const detachSession = sessions.enter(session)
+  sessions.announce(session)
+  const detachAgent = agents.enter(nativeAgent, undefined)
+  agents.announce(nativeAgent)
+  let nativeDisposed = false
+  const nativeHandle: AgentHandle = {
+    agent: nativeAgent,
+    dispose: async () => {
+      nativeDisposed = true
+      detachAgent()
+      detachSession()
+    },
+  }
+  const hostAgentHandles: HostAgentHandleStore = {
+    wait: async (id, agent) => id === String(sessionId) && agent === nativeAgent ? nativeHandle : undefined,
+    take: (id, agent) => id === String(sessionId) && agent === nativeAgent ? nativeHandle : undefined,
+  }
+  const suite = createEngineSuiteRuntime()
+  suite.providers.register({ id: 'promotion-provider', engineId: 'codex-cli', name: 'Promotion Provider', baseUri: 'https://example.test', credentialRef: 'promotion-credential' })
+  suite.models.register({ id: 'promotion-model', engineId: 'codex-cli', providerId: 'promotion-provider', modelId: 'promotion-model', reasoningOptions: [{ id: 'xhigh' }], source: 'manual' })
+  const service = new EngineSuiteAgentService(ctx, suite, () => 'promotion-secret', new ExternalEngineBindingStore(bindingFile), undefined, hostAgentHandles)
+  try {
+    const promoted = await service.createExternal({
+      sessionId: String(sessionId),
+      selection: { engineId: 'codex-cli', providerId: 'promotion-provider', modelRecordId: 'promotion-model', reasoningEffort: 'xhigh' },
+      apiKey: 'promotion-secret', cwd: process.cwd(), executable: process.execPath, args: ['-e', fakeCodexServer()],
+    })
+    try {
+      assert.equal(nativeDisposed, true)
+      assert.equal(promoted.session, session)
+      assert.equal(ctx.sessions.get(sessionId), session)
+      assert.equal(ctx.agents.get(sessionId), promoted.agent)
+      assert.equal(service.list().length, 1)
+    } finally {
+      await promoted.dispose()
+    }
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(root, { recursive: true, force: true })
   }
 })
 

@@ -1,7 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
+import type { AgentHandle, CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import { createEngineSuiteRuntime } from './engine-suite.js'
 import type { EngineSuite } from './engine-suite.js'
-import { EngineSuiteAgentService } from './agent/service.js'
+import { EngineSuiteAgentService, type HostAgentHandleStore } from './agent/service.js'
 import { readDebugCodexProviderSeed, readDebugGlmProviderSeed } from './debug-provider.js'
 import { registerEngineSuiteSettings, syncEngineSuiteSettings, type EngineSuiteSettings } from './settings.js'
 import { EngineSuiteGateway } from './remote.js'
@@ -11,16 +12,55 @@ import { resolveApiKey } from './credential.js'
 /** One installed bundle entry; child capabilities are owned by this plugin. */
 export const inject = ['agents', 'sessions']
 
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void
-  const promise = new Promise<void>(done => { resolve = done })
-  return { promise, resolve }
+interface HostAgentRegistryLike {
+  create(options: CreateAgentOptions): Promise<AgentHandle>
+  resume(options: ResumeAgentOptions): Promise<AgentHandle>
 }
 
-export interface EngineSuitePluginConfig {
-  readonly primary?: boolean
+function trackHostAgentHandles(ctx: Context): HostAgentHandleStore | undefined {
+  const registry = ctx.get('agents') as HostAgentRegistryLike | undefined
+  if (registry === undefined) return undefined
+  const handles = new Map<string, AgentHandle>()
+  const pending = new Map<string, Promise<AgentHandle>>()
+  let active = true
+  const track = (id: string, operation: Promise<AgentHandle>): Promise<AgentHandle> => {
+    pending.set(id, operation)
+    void operation.then(handle => {
+      if (active) handles.set(id, handle)
+      if (pending.get(id) === operation) pending.delete(id)
+    }, () => {
+      if (pending.get(id) === operation) pending.delete(id)
+    })
+    return operation
+  }
+  const originalCreate = registry.create
+  const originalResume = registry.resume
+  registry.create = (options) => track(String(options.sessionId), originalCreate.call(registry, options))
+  registry.resume = (options) => track(String(options.resumeSessionId), originalResume.call(registry, options))
+  ctx.effect(() => () => {
+    active = false
+    registry.create = originalCreate
+    registry.resume = originalResume
+    handles.clear()
+    pending.clear()
+  }, 'engine-suite.host-agent-handles')
+  return {
+    wait: async (sessionId, agent) => {
+      const current = handles.get(sessionId)
+      if (current !== undefined) return current.agent === agent ? current : undefined
+      const started = pending.get(sessionId)
+      if (started === undefined) return undefined
+      const handle = await started
+      return handle.agent === agent ? handle : undefined
+    },
+    take: (sessionId, agent) => {
+      const handle = handles.get(sessionId)
+      if (handle?.agent !== agent) return undefined
+      handles.delete(sessionId)
+      return handle
+    },
+  }
 }
-
 
 function overlayDebugSettings(
   value: EngineSuiteSettings,
@@ -92,14 +132,14 @@ function debugBaseSettings(
   return { providers, models, profiles: [], skillSets: [], mcpSets: [] }
 }
 
-export function apply(ctx: Context, config: EngineSuitePluginConfig = {}): void {
+export function apply(ctx: Context): void {
   const suite = createEngineSuiteRuntime()
   const debugSeed = readDebugCodexProviderSeed(process.env)
   const glmSeed = readDebugGlmProviderSeed(process.env)
   if (glmSeed !== undefined) suite.providers.register(glmSeed.provider)
   if (debugSeed !== undefined) suite.providers.register(debugSeed.provider)
-  const catalogReady = deferred()
   const debugSettings = debugBaseSettings(glmSeed, debugSeed)
+  const hostAgentHandles = trackHostAgentHandles(ctx)
   const llm = ctx.get('llm')
   const llmRoutes = llm === undefined ? undefined : new ExternalEngineLlmRouteRegistration(llm, suite)
   llmRoutes?.sync()
@@ -108,20 +148,17 @@ export function apply(ctx: Context, config: EngineSuitePluginConfig = {}): void 
     ctx,
     suite,
     credentialRef => resolveApiKey(ctx, credentialRef),
-    catalogReady.promise,
+    undefined,
+    undefined,
+    hostAgentHandles,
   )
-  if (config.primary === true) {
-    const registry = ctx.get('agents')
-    if (registry === undefined) throw new Error('Engine Suite primary mode requires Harness AgentRegistry')
-    registry.setFactory(agents)
-  }
   registerEngineSuiteSettings(
     ctx,
     value => {
       syncEngineSuiteSettings(suite, overlayDebugSettings(value, debugSettings))
       llmRoutes?.sync()
     },
-    () => catalogReady.resolve(),
+    undefined,
     debugSettings,
   )
   const service = Object.assign(suite, { agents }) satisfies EngineSuiteRuntimeService

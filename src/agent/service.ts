@@ -48,6 +48,11 @@ interface SessionPersistenceLike {
   prepare(id: SessionId): Promise<SessionPreparationLike>
 }
 
+export interface HostAgentHandleStore {
+  wait(sessionId: string, agent: Agent): Promise<AgentHandle | undefined>
+  take(sessionId: string, agent: Agent): AgentHandle | undefined
+}
+
 function sessionHasConversation(session: Session): boolean {
   return session.events.some(event => event.type === 'turn/start' || event.type === 'user/message')
 }
@@ -216,8 +221,8 @@ export interface EngineSuiteAgentHandle extends AgentHandle {
 
 /**
  * Creates and registers external Engine Agents without replacing Harness core
- * services. The optional primary factory is used only when this plugin is
- * explicitly configured as the AgentFactory owner.
+ * services. Harness owns native Session creation; this service is entered only
+ * by an explicit external-engine selection or child delegation.
  */
 export class EngineSuiteAgentService implements AgentFactory {
   private readonly live = new Set<EngineSuiteAgentHandle>()
@@ -228,14 +233,15 @@ export class EngineSuiteAgentService implements AgentFactory {
   private readonly lineageStore: ParentChildLineageStore
   private readonly closedSessions = new Map<string, Session>()
   private readonly childReservations = new Map<string, number>()
+  private readonly sessionOperations = new Map<string, Promise<void>>()
 
   constructor(
     private readonly ctx: Context,
     private readonly suite: EngineSuiteRuntime,
     private readonly resolveApiKey: (credentialRef: string) => string | Promise<string>,
-    private readonly catalogReady: Promise<void> = Promise.resolve(),
     bindings = new ExternalEngineBindingStore(),
     lineageStore = createParentChildLineageStore(),
+    private readonly hostAgentHandles?: HostAgentHandleStore,
   ) {
     this.bindings = bindings
     this.lineageStore = lineageStore
@@ -250,18 +256,29 @@ export class EngineSuiteAgentService implements AgentFactory {
   }
 
   async createExternal(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle> {
-    return this.createExternalOn(this.ctx, options)
+    return this.withSessionOperation(options.sessionId, async () => {
+      const existing = this.findLiveSession(options.sessionId)
+      if (existing !== undefined) {
+        if (!sameSelection(existing.selection, options.selection)) {
+          await existing.updateSelection(options.selection, options.apiKey, latestWorkspacePermission(existing.session))
+        }
+        return existing
+      }
+      return this.createExternalOn(this.ctx, options)
+    })
   }
 
   async createCodex(options: CreateExternalAgentOptions): Promise<EngineSuiteAgentHandle> {
-    return this.createExternalOn(this.ctx, { ...options, engineId: 'codex-cli' })
+    return this.createExternal({ ...options, selection: { ...options.selection, engineId: 'codex-cli' } })
   }
 
   async switchExternal(sessionId: string, selection: EngineSelection, apiKey: string): Promise<EngineSuiteAgentHandle> {
-    const handle = [...this.live].find(candidate => String(candidate.session.id) === sessionId)
-    if (handle === undefined) throw new Error(`unknown Engine Suite session: ${sessionId}`)
-    await handle.updateSelection(selection, apiKey, latestWorkspacePermission(handle.session))
-    return handle
+    return this.withSessionOperation(sessionId, async () => {
+      const handle = this.findLiveSession(sessionId)
+      if (handle === undefined) throw new Error(`unknown Engine Suite session: ${sessionId}`)
+      await handle.updateSelection(selection, apiKey, latestWorkspacePermission(handle.session))
+      return handle
+    })
   }
 
   async listCommands(sessionId: string, refresh = true): Promise<readonly EngineSuiteCommandView[]> {
@@ -361,21 +378,24 @@ export class EngineSuiteAgentService implements AgentFactory {
     }
   }
 
-  /** AgentRegistry factory entry used by session.create when Engine Suite is primary. */
+  /** Optional AgentFactory entry for embedders that explicitly choose Engine Suite ownership. */
   async createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle> {
-    await this.catalogReady
-    const selection = this.defaultSelection(options.agentOptions)
-    const provider = this.suite.providers.get(selection.providerId)
-    const cwd = options.meta?.cwd ?? process.cwd()
-    const parentAgent = ownerCtx.get('agent')
-    return this.createExternalOn(ownerCtx, {
-      sessionId: String(options.sessionId),
-      selection,
-      apiKey: await this.resolveApiKey(provider.credentialRef),
-      cwd,
-      ...options.meta?.parentSession === undefined ? {} : { parentSessionId: String(options.meta.parentSession) },
-      ...options.meta?.delegationDepth === undefined ? {} : { delegationDepth: options.meta.delegationDepth },
-      ...parentAgent === undefined ? {} : { parentAgent },
+    return this.withSessionOperation(String(options.sessionId), async () => {
+      const existing = this.findLiveSession(String(options.sessionId))
+      if (existing !== undefined) return existing
+      const selection = this.defaultSelection(options.agentOptions)
+      const provider = this.suite.providers.get(selection.providerId)
+      const cwd = options.meta?.cwd ?? process.cwd()
+      const parentAgent = ownerCtx.get('agent')
+      return this.createExternalOn(ownerCtx, {
+        sessionId: String(options.sessionId),
+        selection,
+        apiKey: await this.resolveApiKey(provider.credentialRef),
+        cwd,
+        ...options.meta?.parentSession === undefined ? {} : { parentSessionId: String(options.meta.parentSession) },
+        ...options.meta?.delegationDepth === undefined ? {} : { delegationDepth: options.meta.delegationDepth },
+        ...parentAgent === undefined ? {} : { parentAgent },
+      })
     })
   }
 
@@ -628,6 +648,24 @@ export class EngineSuiteAgentService implements AgentFactory {
     }
   }
 
+  private findLiveSession(sessionId: string): EngineSuiteAgentHandle | undefined {
+    const id = String(SessionId(sessionId))
+    return [...this.live].find(candidate => String(candidate.session.id) === id)
+  }
+
+  private async withSessionOperation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const id = String(SessionId(sessionId))
+    const previous = this.sessionOperations.get(id) ?? Promise.resolve()
+    const current = previous.then(operation)
+    const settled = current.then(() => undefined, () => undefined)
+    this.sessionOperations.set(id, settled)
+    try {
+      return await current
+    } finally {
+      if (this.sessionOperations.get(id) === settled) this.sessionOperations.delete(id)
+    }
+  }
+
   private async createExternalOn(
     ownerCtx: Context,
     options: InternalCreateExternalAgentOptions,
@@ -646,7 +684,19 @@ export class EngineSuiteAgentService implements AgentFactory {
       throw new Error(`cannot attach an external Engine to a non-empty Session: ${String(id)}`)
     }
     const session: Session = options.session ?? existingSession ?? sessions.prepare(id, { meta: { cwd: options.cwd || process.cwd() } })
-    const ownsSession = sessions.get(id) !== session
+    const existingAgent = agents.get(id)
+    const existingExternal = this.findLiveSession(String(id))
+    let nativeHandle: AgentHandle | undefined
+    if (existingAgent !== undefined && existingExternal === undefined) {
+      if (sessionHasConversation(session)) {
+        throw new Error(`Engine selection is locked after the first turn: ${String(id)}`)
+      }
+      nativeHandle = await this.hostAgentHandles?.wait(String(id), existingAgent)
+      if (nativeHandle === undefined) {
+        throw new Error(`cannot attach an external Engine to blank Session ${String(id)}: another Agent is already attached`)
+      }
+    }
+    let ownsSession = sessions.get(id) !== session
     const runtimeRoot = options.runtimeRoot ?? this.bindings.runtimeRoot(String(id))
     const permissionPreset = latestWorkspacePermission(session)
     let agent: ExternalEngineAgent | undefined
@@ -684,7 +734,16 @@ export class EngineSuiteAgentService implements AgentFactory {
     let detachSession: (() => void) | undefined
     let detachAgent: (() => void) | undefined
     let detachLineageRuntime: (() => void) | undefined
+    let handle: EngineSuiteAgentHandle | undefined
     try {
+      if (existingAgent !== undefined && existingExternal === undefined) {
+        const takenNativeHandle = this.hostAgentHandles?.take(String(id), existingAgent)
+        if (takenNativeHandle === undefined || takenNativeHandle !== nativeHandle) {
+          throw new Error(`cannot replace the native Agent for blank Session ${String(id)}`)
+        }
+        await takenNativeHandle.dispose()
+        ownsSession = true
+      }
       const existingHeader = session.requestHeader()
       if (existingHeader === undefined || !sessionHasConversation(session)) {
         const config: LlmCallConfig = { provider: provider.id, model: model.modelId }
@@ -717,15 +776,6 @@ export class EngineSuiteAgentService implements AgentFactory {
       agents.announce(agent)
       agentEvents(ownerCtx, agent).emit('agent/session-start', { source: options.resumeThreadId === undefined ? 'startup' : 'resume' })
       if (launch.nativeSessionId === '') throw new Error(`External engine did not publish a native session id for ${String(id)}`)
-      await this.bindings.put({
-        sessionId: String(id),
-        engineId: options.engineId ?? profile.engineId,
-        nativeSessionId: launch.nativeSessionId,
-        runtimeRoot,
-        selection: options.selection,
-        ...options.executable === undefined ? {} : { executable: options.executable },
-        ...options.args === undefined ? {} : { args: [...options.args] },
-      })
       let activeLaunch = launch
       let activeApiKey = options.apiKey
       let activeEnvironment: Readonly<Record<string, string>> = environment
@@ -744,7 +794,7 @@ export class EngineSuiteAgentService implements AgentFactory {
           if (event !== undefined) this.observeChildRuntimeEvent(lineage, event)
         })
       }
-      const handle: EngineSuiteAgentHandle = {
+      handle = {
         agent,
         session,
         ...options.parentSessionId === undefined ? {} : { parentSessionId: options.parentSessionId },
@@ -770,14 +820,14 @@ export class EngineSuiteAgentService implements AgentFactory {
           return commandOperation
         },
         updateSelection: async (nextSelection, nextApiKey, nextPermissionPreset) => {
-          if (sameSelection(handle.selection, nextSelection)) return
+          if (sameSelection(handle!.selection, nextSelection)) return
           const hasConversation = sessionHasConversation(session)
-          if (hasConversation && nextSelection.engineId !== handle.selection.engineId) {
+          if (hasConversation && nextSelection.engineId !== handle!.selection.engineId) {
             throw new Error(`Engine selection is locked after the first turn: ${String(id)}`)
           }
           if (agent!.status !== 'idle') throw new Error(`Engine selection is locked while session ${String(id)} is busy`)
           const previousLaunch = activeLaunch
-          const previousSelection = handle.selection
+          const previousSelection = handle!.selection
           const previousApiKey = activeApiKey
           const nextProfile = this.suite.resolveProfile(nextSelection)
           const nextProvider = this.suite.providers.get(nextProfile.providerId)
@@ -852,8 +902,8 @@ export class EngineSuiteAgentService implements AgentFactory {
           activeEnvironment = nextEnvironment
           activeInternalMcpSet = nextInternalMcpSet
           commandCatalog = undefined
-          handle.profileId = nextProfile.id
-          handle.selection = nextSelection
+          handle!.profileId = nextProfile.id
+          handle!.selection = nextSelection
           const config: LlmCallConfig = { provider: nextProvider.id, model: nextModel.modelId }
           if (nextProfile.reasoningEffort !== undefined) {
             config.reasoningEffort = nextProfile.reasoningEffort as NonNullable<LlmCallConfig['reasoningEffort']>
@@ -875,7 +925,7 @@ export class EngineSuiteAgentService implements AgentFactory {
             await this.cancelChildren(String(id))
             this.children.delete(String(id))
             this.closedSessions.set(String(id), session)
-            this.live.delete(handle)
+            this.live.delete(handle!)
             commandClosed = true
             commandCatalog = undefined
             commandOperation = undefined
@@ -884,7 +934,7 @@ export class EngineSuiteAgentService implements AgentFactory {
             if (bridgeActive) this.childBridge.release(String(id))
             if (options.parentSessionId !== undefined) {
               const siblings = this.children.get(options.parentSessionId)
-              siblings?.delete(handle)
+              siblings?.delete(handle!)
               if (siblings !== undefined && siblings.size === 0) this.children.delete(options.parentSessionId)
             }
             await agent!.dispose()
@@ -896,20 +946,33 @@ export class EngineSuiteAgentService implements AgentFactory {
         },
       }
       observeRuntime(activeLaunch.runtime)
-      this.live.add(handle)
+      this.live.add(handle!)
       ownerCtx.effect(() => () => {
-        if (this.shouldDisposeWithParent(handle)) void handle.dispose()
+        if (this.shouldDisposeWithParent(handle!)) void handle!.dispose()
       }, `engine-suite.agent(${String(id)})`)
       await this.attachWorkspace(ownerCtx, session.header.cwd ?? options.cwd, id)
-      return handle
+      await this.bindings.put({
+        sessionId: String(id),
+        engineId: options.engineId ?? profile.engineId,
+        nativeSessionId: launch.nativeSessionId,
+        runtimeRoot: activeLaunch.runtimeRoot,
+        selection: options.selection,
+        ...options.executable === undefined ? {} : { executable: options.executable },
+        ...options.args === undefined ? {} : { args: [...options.args] },
+      })
+      return handle!
     } catch (error: unknown) {
       detachLineageRuntime?.()
       detachLineageRuntime = undefined
-      if (bridgeActive) this.childBridge.release(String(id))
-      await agent?.dispose().catch(() => {})
-      detachAgent?.()
-      detachSession?.()
-      await launch.close()
+      if (handle !== undefined) {
+        await handle.dispose().catch(() => {})
+      } else {
+        if (bridgeActive) this.childBridge.release(String(id))
+        await agent?.dispose().catch(() => {})
+        detachAgent?.()
+        detachSession?.()
+        await launch.close()
+      }
       throw error
     }
   }

@@ -1,12 +1,6 @@
-# Engine Suite owns new Agent creation in this development profile. The native
-# agent loop stays disabled so a CLI-selected session cannot fall back to the
-# Harness DeepSeek prompt/tool pipeline.
-- id: agent-loop
-  disabled: true
-
-# One installable bundle entry. Internal EngineSuite capabilities are mounted by src/plugin.ts.
+# One installable bundle entry. Harness keeps ownership of Native Agent creation;
+# this plugin contributes the Engine Suite catalog and explicit external-session
+# attach/switch surface without taking over Host session birth.
 - insert:
     - id: engine-suite
       name: '@wolffycode/dsh-engine-suite'
-      config:
-        primary: true

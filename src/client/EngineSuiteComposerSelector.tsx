@@ -155,8 +155,13 @@ export function EngineSuiteComposerSelector({
   useEffect(() => {
     if (selectedEngine?.type === 'deepseek-native') return
     if (providerId === '' || modelRecordId === '') return
-    runtime?.setSessionSelection(sessionId, currentSelection())
-  })
+    runtime?.setSessionSelection(sessionId, {
+      engineId,
+      providerId,
+      modelRecordId,
+      ...reasoningEffort === '' ? {} : { reasoningEffort },
+    })
+  }, [engineId, modelRecordId, providerId, reasoningEffort, runtime, selectedEngine?.type, sessionId])
 
   useEffect(() => {
     if (!showPreset || agentPreset === undefined) {
@@ -266,7 +271,12 @@ export function EngineSuiteComposerSelector({
 
   const applySelection = (selection: EngineSuiteSelectionRequest): void => {
     const engine = engines.find(candidate => candidate.id === selection.engineId)
-    if (runtime === undefined || engine === undefined || engine.type === 'deepseek-native') return
+    if (engine === undefined) return
+    if (engine.type === 'deepseek-native') {
+      runtime?.setSessionSelection(sessionId, selection)
+      return
+    }
+    if (runtime === undefined) return
     if (locked || (engineLocked && selection.engineId !== engineId) || selection.providerId === '' || selection.modelRecordId === '') return
     setSelectionBusy(true)
     setSelectionError(undefined)
