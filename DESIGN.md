@@ -58,7 +58,7 @@ Harness Session
 
 ## Profile、Session 与 child Agent
 
-Composer 顺序固定为 `Engine → Provider → Model → Reasoning`。Profile 保存 selection、revision、Skill/MCP 引用和 child policy。空白 Session 才能切换引擎；已有对话保持 engine identity，模型/reasoning 变化复用同一 native session/thread。
+Composer 顺序固定为 `Engine → Provider → Model → Reasoning`。Profile 保存 selection、revision、Skill/MCP 引用和 child policy。Harness 的 `session.create` 始终由宿主 Native AgentFactory 建立可用的空白 Session；Engine Suite 只有在用户明确选择 Claude/Codex 后才启动外部 runtime 并 attach 到该空白 Session，因此外部进程 readiness 不属于 Session birth。空白 Session 才能切换引擎；已有对话保持 engine identity，模型/reasoning 变化复用同一 native session/thread。
 
 父子 Agent 使用独立 Harness Session，并通过 `parentSession`、`origin=subagent`、`delegationDepth` 建立 lineage。`allowedChildProfiles`、`maxChildDepth` 和 `maxConcurrentChildren` 必须授权；本地 MCP bridge 不传 credential。
 
