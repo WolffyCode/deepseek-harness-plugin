@@ -10,7 +10,7 @@
 - Session attach、空白 Session 引擎切换、native session/thread binding；
 - Skill/MCP 显式资产、credentialRef、child Agent policy 和本地认证 delegation bridge；
 - 不向 CLI 注入 Harness System Prompt、Tool Schema 或 Harness/cross-engine agent map；
-- Provider key 不落盘；Claude Opus 被过滤并拒绝。
+- Provider key 不落盘、不输出；Claude 真实验证只允许 GLM，并拒绝 Opus。
 
 Claude 源码在 `src/claude/`，通用桥在 `src/agent/`，Codex 源码在 `src/codex/`。不存在旧的 Claude `launch.ts` 或 `runtime.ts` 文件。
 
@@ -38,7 +38,9 @@ git diff --check
 
 ## 外部 smoke
 
-真实 Claude E2E 需要 Claude-compatible `/v1/messages`（或 `ANTHROPIC_BASE_URL`）、认证环境变量、可执行的本地 `claude` CLI 和非 Opus GLM model：
+真实 Claude E2E 要求配置的 Provider 同时提供 Anthropic Messages API 的 `GET /v1/models` 和 `POST /v1/messages`、认证环境变量、可执行的本地 `claude` CLI，以及 GLM model；不做 OpenAI 伪适配。Preflight 明确返回 `endpoint-mismatch`、`auth`、`network` 或 `protocol` 分类；只有缺少必需外部环境变量时真实 E2E 才显式 skip，Provider endpoint mismatch 不得 skip。
+
+2026-08-27 的真实 Provider 结果是 `GET /v1/models = 200`、`POST /v1/messages = 404`，因此分类为 `endpoint-mismatch`，真实 Claude E2E 按失败处理而不是 skip。只实现 `/v1/models` 或仅提供 OpenAI 路由不能通过 Claude CLI 验证。
 
 ```bash
 DSH_CLAUDE_REAL_BASE_URI=... \
@@ -48,6 +50,8 @@ DSH_CLAUDE_REAL_EXECUTABLE=claude \
 npm run test:claude-real
 ```
 
+认证 token 只通过当前进程环境和内存传递；验证诊断会脱敏，token 不写入 runtime 文件，也不出现在测试或脚本输出中。真实验证模型必须是 GLM，任何 Opus model 都会在请求前拒绝。
+
 真实 Codex Smoke 需要 endpoint、API key 和本地 `codex app-server`，key 只通过环境变量传入：
 
 ```bash
@@ -56,4 +60,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-缺少真实 Claude 前置时，完整 `npm test` 的结果是 **139 tests / 138 pass / 1 external skip**；这个 skip 是外部前置的显式结果，不是被测试逻辑掩盖的失败。
+截至 2026-08-27，`npm run typecheck`、`npm test`、`pnpm test`、`npm run build`、`pnpm pack --dry-run` 和 `git diff --check` 均已通过；`npm test` 与 `pnpm test` 均为 **148 tests / 147 pass / 1 external skip**。该 skip 仅来自缺少必需的真实 Claude 外部环境变量。

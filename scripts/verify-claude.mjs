@@ -4,9 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk'
 import { createClaudeProviderSession } from '../src/claude/adapter.ts'
+import { assertClaudeRealModelAllowed, preflightClaudeProvider } from '../src/claude/provider-preflight.ts'
 
 const DEFAULT_MODEL = 'glm-5.3'
 const TIMEOUT_MS = 120_000
+const INITIALIZATION_TIMEOUT_MS = 30_000
+const PROVIDER_PREFLIGHT_TIMEOUT_MS = 10_000
 
 function firstEnv(...names) {
   for (const name of names) {
@@ -35,22 +38,21 @@ function errorText(error, secret) {
 
 
 function preflight(config) {
+  try {
+    assertClaudeRealModelAllowed(config.model)
+  } catch (error) {
+    return { kind: 'failed', reason: errorText(error, '') }
+  }
   const missing = []
   if (!config.baseUri) missing.push('DSH_CLAUDE_REAL_BASE_URI')
   if (!config.authToken) missing.push('DSH_CLAUDE_REAL_AUTH_TOKEN')
   if (missing.length) {
-    return `missing real Claude provider environment: ${missing.join(', ')} (model defaults to ${DEFAULT_MODEL}; aliases DSH_DEBUG_GLM_* and ANTHROPIC_* are accepted)`
+    return {
+      kind: 'skipped',
+      reason: `missing real Claude provider environment: ${missing.join(', ')} (model defaults to ${DEFAULT_MODEL}; aliases DSH_DEBUG_GLM_* and ANTHROPIC_* are accepted)`,
+    }
   }
-  if (/opus/i.test(config.model)) throw new Error(`Claude real verification rejects Opus model: ${config.model}`)
-  if (!/glm/i.test(config.model)) throw new Error(`Claude real verification only permits GLM models; received ${config.model}`)
-  const result = spawnSync(config.executable, ['--version'], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 10_000,
-  })
-  if (result.error) return `local Claude CLI precondition failed for ${config.executable}: ${result.error.message}`
-  if (result.status !== 0) return `local Claude CLI precondition failed for ${config.executable}: exit ${result.status ?? 'unknown'}`
-  return undefined
+  return { kind: 'ready' }
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -131,21 +133,35 @@ async function runTurn(session, prompt) {
 
 const config = readConfig()
 const precondition = preflight(config)
-if (precondition) {
-  console.error(JSON.stringify({ status: 'skipped', reason: precondition }))
+if (precondition.kind === 'skipped') {
+  console.error(JSON.stringify({ status: 'skipped', reason: precondition.reason }))
   process.exitCode = 2
+} else if (precondition.kind === 'failed') {
+  console.error(JSON.stringify({ status: 'failed', reason: precondition.reason }))
+  process.exitCode = 1
 } else {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-claude-real-'))
-  const cwd = join(root, 'cwd')
-  const configDir = join(root, 'claude-config')
-  const queryState = { count: 0 }
+  let root
   let session
+  const queryState = { count: 0 }
   try {
+    const provider = await preflightClaudeProvider({
+      baseUri: config.baseUri,
+      authToken: config.authToken,
+      model: config.model,
+      timeoutMs: PROVIDER_PREFLIGHT_TIMEOUT_MS,
+    })
+    if (!provider.ok) throw new Error(`[external-provider:${provider.kind}] ${provider.message}`)
+    const cli = spawnSync(config.executable, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
+    if (cli.error) throw new Error(`local Claude CLI precondition failed for ${config.executable}: ${cli.error.message}`)
+    if (cli.status !== 0) throw new Error(`local Claude CLI precondition failed for ${config.executable}: exit ${cli.status ?? 'unknown'}`)
+    root = await mkdtemp(join(tmpdir(), 'dsh-claude-real-'))
+    const cwd = join(root, 'cwd')
+    const configDir = join(root, 'claude-config')
     const { mkdir } = await import('node:fs/promises')
     await mkdir(cwd, { recursive: true })
     await mkdir(configDir, { recursive: true })
     session = createSession(config, cwd, configDir, undefined, queryState)
-    await withTimeout(session.whenReady(), TIMEOUT_MS, 'Claude initialization')
+    await withTimeout(session.whenReady(), INITIALIZATION_TIMEOUT_MS, 'Claude initialization')
     const nativeSessionId = session.sessionId
     if (!nativeSessionId) throw new Error('Claude initialization did not expose a native session id')
     const turn = await runTurn(session, 'Use the Bash tool to run exactly: printf REAL_TOOL_OK. Then reply with exactly: REAL_CLAUDE_OK')
@@ -156,7 +172,7 @@ if (precondition) {
     await session.close()
     await session.close()
     session = createSession(config, cwd, configDir, nativeSessionId, queryState)
-    await withTimeout(session.whenReady(), TIMEOUT_MS, 'Claude resume initialization')
+    await withTimeout(session.whenReady(), INITIALIZATION_TIMEOUT_MS, 'Claude resume initialization')
     if (session.sessionId !== nativeSessionId) throw new Error('Claude resume returned a different native session id')
     const resumed = await runTurn(session, 'Reply with exactly: REAL_CLAUDE_RESUMED')
     if (!resumed.firstToken || !resumed.result.finalText.includes('REAL_CLAUDE_RESUMED')) throw new Error('Claude resume did not stream the expected response')
@@ -182,6 +198,6 @@ if (precondition) {
     process.exitCode = 1
   } finally {
     await session?.close().catch(() => undefined)
-    await rm(root, { recursive: true, force: true })
+    if (root !== undefined) await rm(root, { recursive: true, force: true })
   }
 }

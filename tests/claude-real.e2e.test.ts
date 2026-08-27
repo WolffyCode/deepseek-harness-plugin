@@ -6,10 +6,13 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk'
 import { createClaudeProviderSession } from '../src/claude/adapter.js'
+import { assertClaudeRealModelAllowed, preflightClaudeProvider } from '../src/claude/provider-preflight.js'
 import type { ClaudeAdapterEvent, ClaudeAgentSession, ClaudeQueryFactory } from '../src/claude/types.js'
 
 const DEFAULT_MODEL = 'glm-5.3'
 const TIMEOUT_MS = 120_000
+const INITIALIZATION_TIMEOUT_MS = 30_000
+const PROVIDER_PREFLIGHT_TIMEOUT_MS = 10_000
 
 type RealConfig = {
   readonly baseUri: string
@@ -40,22 +43,22 @@ function readConfig(): { readonly config?: RealConfig; readonly skip?: string; r
   const authToken = firstEnv('DSH_CLAUDE_REAL_AUTH_TOKEN', 'DSH_DEBUG_GLM_AUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN')
   const model = firstEnv('DSH_CLAUDE_REAL_MODEL') ?? DEFAULT_MODEL
   const executable = firstEnv('DSH_CLAUDE_REAL_EXECUTABLE') ?? 'claude'
+  try {
+    assertClaudeRealModelAllowed(model)
+  } catch (error) {
+    return { reject: safeError(error, '') }
+  }
   const missing = [
     baseUri ? undefined : 'DSH_CLAUDE_REAL_BASE_URI',
     authToken ? undefined : 'DSH_CLAUDE_REAL_AUTH_TOKEN',
   ].filter((value): value is string => value !== undefined)
   if (missing.length) return { skip: `missing real Claude provider environment: ${missing.join(', ')} (model defaults to ${DEFAULT_MODEL})` }
-  if (/opus/i.test(model)) return { reject: `Claude real E2E rejects Opus model: ${model}` }
-  if (!/glm/i.test(model)) return { reject: `Claude real E2E only permits GLM models; received ${model}` }
-  const cli = spawnSync(executable, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
-  if (cli.error) return { skip: `local Claude CLI precondition failed for ${executable}: ${cli.error.message}` }
-  if (cli.status !== 0) return { skip: `local Claude CLI precondition failed for ${executable}: exit ${cli.status ?? 'unknown'}` }
   return { config: { baseUri: baseUri!, authToken: authToken!, model, executable } }
 }
 
-function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = TIMEOUT_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
     promise.then(value => { clearTimeout(timer); resolve(value) }, error => { clearTimeout(timer); reject(error) })
   })
 }
@@ -140,6 +143,18 @@ const realTest = test('Claude real CLI + SDK query E2E (opt-in)', { skip: prefli
   if (preflight.reject) throw new Error(preflight.reject)
   const config = preflight.config
   assert.ok(config)
+  const provider = await preflightClaudeProvider({
+    baseUri: config.baseUri,
+    authToken: config.authToken,
+    model: config.model,
+    timeoutMs: PROVIDER_PREFLIGHT_TIMEOUT_MS,
+  })
+  if (!provider.ok) {
+    throw new Error(`[external-provider:${provider.kind}] ${provider.message}`)
+  }
+  const cli = spawnSync(config.executable, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
+  if (cli.error) throw new Error(`local Claude CLI precondition failed for ${config.executable}: ${cli.error.message}`)
+  if (cli.status !== 0) throw new Error(`local Claude CLI precondition failed for ${config.executable}: exit ${cli.status ?? 'unknown'}`)
   const root = await mkdtemp(join(tmpdir(), 'dsh-claude-real-test-'))
   const cwd = join(root, 'cwd')
   const configDir = join(root, 'claude-config')
@@ -149,7 +164,7 @@ const realTest = test('Claude real CLI + SDK query E2E (opt-in)', { skip: prefli
   let session: ClaudeAgentSession | undefined
   try {
     session = createSession(config, cwd, configDir, queryCount)
-    await withTimeout(session.whenReady?.() ?? Promise.reject(new Error('Claude session has no readiness gate')), 'Claude initialization')
+    await withTimeout(session.whenReady?.() ?? Promise.reject(new Error('Claude session has no readiness gate')), 'Claude initialization', INITIALIZATION_TIMEOUT_MS)
     const nativeSessionId = session.sessionId
     assert.ok(nativeSessionId, 'real Claude system/init did not provide a native session id')
     assert.equal(queryCount.value, 1, 'the E2E must create an SDK query')
@@ -163,7 +178,7 @@ const realTest = test('Claude real CLI + SDK query E2E (opt-in)', { skip: prefli
     await session.close()
     await session.close()
     session = createSession(config, cwd, configDir, queryCount, nativeSessionId)
-    await withTimeout(session.whenReady?.() ?? Promise.reject(new Error('Claude resumed session has no readiness gate')), 'Claude resume initialization')
+    await withTimeout(session.whenReady?.() ?? Promise.reject(new Error('Claude resumed session has no readiness gate')), 'Claude resume initialization', INITIALIZATION_TIMEOUT_MS)
     assert.equal(session.sessionId, nativeSessionId, 'resume must retain the native session id')
     const resumed = await runTurn(session, 'Reply with exactly: REAL_CLAUDE_RESUMED')
     assert.equal(resumed.firstToken, true)

@@ -1,6 +1,6 @@
 # Claude/GLM 发布基线
 
-- **审计日期**：2026-08-26
+- **审计日期**：2026-08-27
 - **范围**：只描述本插件仓库 `/Users/zhuanzmima0000/Desktop/coding/person/deepseek-harness/deepseek-harness-plugin` 的当前实现与测试，不描述 `deepseek-harness` 源码。
 - **发布结论**：当前可发布能力是 **GLM/Codex-only**：`claude-cli` 只允许 GLM 模型，`codex-cli` 使用 Codex app-server；Claude Opus 被过滤并在会话创建、模型切换和真实 E2E 前拒绝。
 - **当前实现位置**：Claude 代码位于 `src/claude/{adapter,catalog,commands,control,mcp,persistence,process,requests,rewind,session,skills,subagents,transport,types}.ts`。仓库中不存在也不应再引用 `src/claude/launch.ts` 或 `src/claude/runtime.ts`；通用外部引擎事件与桥接位于 `src/agent/`。
@@ -35,9 +35,9 @@ Harness 继续拥有 Session、Workspace、持久事件、Agent 生命周期和 
 
 ## 不可违反的安全与模型策略
 
-1. **Opus 禁止**：模型 catalog、selection、Claude session construction、model switch 和真实 E2E 均拒绝 Opus。
+1. **GLM-only 与 Opus 禁止**：真实 Claude 验证只允许 GLM model；Opus 在 model catalog、selection、Claude session construction、model switch 和真实 E2E 入口均拒绝。
 2. **无 Harness 注入**：Claude SDK options 不传 Harness system prompt、tool schema 或 Harness/cross-engine agent map；用户显式 Claude agent 定义只能通过 opt-in wrapper 进入 SDK 边界。
-3. **凭据不落盘**：Provider 只保存 credentialRef；API token/key 只通过当前进程环境或内存解析，不进入 Settings、Session、`config.toml`、MCP 静态环境变量或日志。
+3. **凭据不落盘**：Provider 只保存 credentialRef；API token/key 只通过当前进程环境或内存解析，不进入 Settings、Session、`config.toml`、MCP 静态环境变量、日志或验证输出。
 4. **工具归属清晰**：CLI 自己执行原生工具，插件只投影事件，不把 CLI 工具调用伪装成 Harness tool loop。
 5. **子 Agent 受策略授权**：child profile、深度、并发和 parent lineage 由插件策略控制，credential 不经 MCP 请求传递。
 
@@ -55,9 +55,11 @@ pnpm test
 git diff --check
 ```
 
-截至 2026-08-26 的真实结果：`npm run typecheck` **通过**；`npm test` 和 `pnpm test` 均为 **135 tests / 134 pass / 1 external skip**；`npm run build` **通过**。构建后 `lib/types/client/index.d.ts` 等 client declaration artifacts 与 package exports 一致。
+截至 2026-08-27 的真实结果：`npm run typecheck`、`npm test`、`pnpm test`、`npm run build`、`pnpm pack --dry-run` 和 `git diff --check` **通过**；`npm test` 和 `pnpm test` 均为 **148 tests / 147 pass / 1 external skip**。构建后 `lib/types/client/index.d.ts` 等 client declaration artifacts 与 package exports 一致。
 
-真实 Claude E2E 不属于无凭据单测：`tests/claude-real.e2e.test.ts` 需要可访问的 Claude-compatible `/v1/messages`（或 `ANTHROPIC_BASE_URL`）端点、认证环境变量、可执行的本地 `claude` CLI，以及非 Opus 的 GLM model。缺少这些外部前置时，该测试按设计 skip；它不能被改成静默通过，也不能用 fake query 代替真实 E2E。
+真实 Claude E2E 不属于无凭据单测：`tests/claude-real.e2e.test.ts` 要求 Anthropic Messages API 的 `GET /v1/models` 与 `POST /v1/messages`、认证环境变量、可执行的本地 `claude` CLI，以及 GLM model。preflight 将失败明确分类为 `endpoint-mismatch`、`auth`、`network` 或 `protocol`；这些 Provider 失败都必须让真实 E2E 失败，只有缺少必需外部环境变量时才显式 skip。它不能被改成静默通过，也不能用 fake query 或 OpenAI 伪适配代替真实 E2E。
+
+2026-08-27 的真实 Provider 验证结果是 `GET /v1/models = 200`、`POST /v1/messages = 404`，分类为 `endpoint-mismatch`。因此该 Provider 不能供 Claude CLI 使用；GET models 成功不足以证明 Anthropic Messages API 可用。认证 token 只在当前进程环境和内存中传递，诊断脱敏，不写入 runtime 文件或输出。
 
 真实 Claude E2E 示例：
 

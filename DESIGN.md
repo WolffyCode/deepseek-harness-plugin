@@ -39,9 +39,9 @@ Harness 负责 Session 持久事件、Workspace、权限、Agent 生命周期和
 
 Claude 通过 SDK query 使用 `claude -p` 的 stream-json 能力。启动参数由 `src/claude/session.ts` 和 `src/claude/transport.ts` 组织，`src/claude/process.ts` 负责按 SDK 提供的完整环境启动子进程、截断并脱敏 stderr，以及在取消和关闭时回收整个进程组；参数包含 bare、stream input/output、partial message、model 和 effort；权限由 `src/claude/control.ts` 转到 Harness Approval。
 
-Provider 只以 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 和内存 credential 组成当前进程环境。Harness prompt、tool schema、Harness/cross-engine agent map 不进入 Claude SDK options。用户显式 Claude agent 定义必须通过 opt-in wrapper。
+Provider 只以 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 和内存 credential 组成当前进程环境。真实 Claude 启动前必须通过 Anthropic Messages API preflight：`GET /v1/models` 与 `POST /v1/messages` 都要可达；只实现 OpenAI 路由的 Provider 不兼容 Claude CLI。失败明确分类为 `endpoint-mismatch`、`auth`、`network` 或 `protocol`，endpoint mismatch、认证、网络和协议失败都必须失败，不得被真实 E2E 当作 skip。Harness prompt、tool schema、Harness/cross-engine agent map 不进入 Claude SDK options。用户显式 Claude agent 定义必须通过 opt-in wrapper。
 
-当前 Claude model policy 是 GLM-only + Opus deny。SDK catalog 中任何 Opus 字段都会被过滤；selection、会话构造、模型切换和真实 E2E 也会再次拒绝。
+当前真实 Claude model policy 是 GLM-only + Opus deny。真实验证入口只接受 GLM model，并在请求前拒绝 Opus；SDK catalog 中任何 Opus 字段都会被过滤。Provider key 只在当前进程环境和内存中存在，诊断脱敏，runtime 文件、日志和验证输出都不得包含 token。
 
 ## Codex
 
@@ -78,6 +78,6 @@ pnpm pack --dry-run
 git diff --check
 ```
 
-截至 2026-08-26 的真实基线是：`npm run typecheck` 通过；`npm test` 和 `pnpm test` 均为 **139 tests / 138 pass / 1 external skip**；`npm run build` 通过，并生成可发布的 Host、Remote、client bundle 与 client declaration artifacts。外部 skip 是真实 Claude E2E：它需要 Claude-compatible endpoint、认证环境变量、可执行的本地 `claude` CLI 和 GLM model；缺少任一前置时 skip 是显式结果，不得改成无条件通过。
+截至 2026-08-27，`npm run typecheck`、`npm test`、`pnpm test`、`npm run build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过；`npm test` 与 `pnpm test` 均为 **148 tests / 147 pass / 1 external skip**。真实 Provider 的已验证结果是 `GET /v1/models = 200`、`POST /v1/messages = 404`，preflight 分类为 `endpoint-mismatch`，真实 Claude E2E 必须失败而不是 skip；只有缺少必需外部环境变量时才显式 skip。
 
 pnpm 的独立仓库修复、依赖版本选择和 Typert generator 发布依赖见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。
