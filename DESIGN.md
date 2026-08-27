@@ -75,9 +75,10 @@ npm test
 npm run build
 pnpm test
 pnpm pack --dry-run
+# 在独立临时目录执行 pnpm install、typecheck、build、pack，并安装本地 tarball
 git diff --check
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。真实 Provider 结果必须以本次 preflight 为准；`endpoint-mismatch`、认证、网络和协议错误都必须失败，只有缺少必需外部环境变量时才显式 skip。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **212 tests / 208 pass / 0 fail / 4 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run`、clean-temp package install/pack smoke 和 `git diff --check` 均通过。skip 只表示外部 E2E 的必需 Provider 环境缺失，不计为 pass。真实 Provider 结果必须以本次 preflight 为准；`endpoint-mismatch`、认证、网络和协议错误都必须失败。
 
-pnpm 的独立仓库修复、依赖版本选择和 Typert generator 发布依赖见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。
+独立仓库依赖版本、安装脚本许可和 Typert generator fixture 见 `DESIGN-CLAUDE-PARITY.md` 的“pnpm 404 根因与修复”。

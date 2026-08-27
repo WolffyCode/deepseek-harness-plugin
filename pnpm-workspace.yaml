@@ -3,6 +3,9 @@ packages:
 
 autoInstallPeers: false
 
+allowBuilds:
+  esbuild: true
+
 minimumReleaseAgeExclude:
   - '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.246'
   - '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.246'

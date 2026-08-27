@@ -55,7 +55,7 @@ pnpm test
 git diff --check
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` **通过**。构建后 `lib/types/client/index.d.ts` 等 client declaration artifacts 与 package exports 一致。两个 skip 仅表示缺少真实 Claude Provider 环境，不能当作真实 E2E 通过。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **212 tests / 208 pass / 0 fail / 4 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run`、clean-temp package install/pack smoke 和 `git diff --check` **通过**。构建后 `lib/types/client/index.d.ts`、`lib/typert.host.*` 和 `lib/typert.remote-client.*` 与 package exports 一致。4 个 skip 都是显式外部 E2E 环境缺失，不能当作真实 E2E 通过。
 
 真实 Claude E2E 不属于无凭据单测：`tests/claude-real.e2e.test.ts` 要求 Anthropic Messages API 的 `GET /v1/models` 与 `POST /v1/messages`、认证环境变量、可执行的本地 `claude` CLI，以及 GLM model。preflight 将失败明确分类为 `endpoint-mismatch`、`auth`、`network` 或 `protocol`；这些 Provider 失败都必须让真实 E2E 失败，只有缺少必需外部环境变量时才显式 skip。它不能被改成静默通过，也不能用 fake query 或 OpenAI 伪适配代替真实 E2E。
 
@@ -88,9 +88,10 @@ npm run verify:codex
 根修复已在源头完成：
 
 - 所有 DSH peer 的最低版本提升到当前发布线 `0.1.1-rc.2`，不再允许回退到保留旧 `dsh-type-meta` 的版本；
-- 开发依赖显式安装当前 peer 版本，使独立插件仓库的 typecheck/build 不依赖父目录 symlink；
-- 新增单包 `pnpm-workspace.yaml`，显式设置 `autoInstallPeers: false`，与 `pnpm-lock.yaml` 一致；
+- 开发依赖显式安装当前 peer 版本和 Typert generator，使独立插件仓库的 typecheck/build 不依赖父目录；
+- 新增单包 `pnpm-workspace.yaml`，显式设置 `autoInstallPeers: false`，并只允许 `esbuild` 安装脚本，与 `pnpm-lock.yaml` 一致；
 - `packageManager` 固定为 `pnpm@11.11.0`；
-- 发布包直接提交生成后的 `lib/typert.*` artifacts；`scripts/generate-typert.mjs` 在源码重生成时只读父仓库的 generator/protocol 源码，不修改父仓库。
+- 发布包直接提交生成后的 `lib/typert.*` artifacts；`scripts/generate-typert.mjs` 使用已发布的 Typert generator 和仓库内 protocol 编译 fixture，在独立临时 workspace 中生成并在结束时删除，不读取父仓库。
+- `pnpm-workspace.yaml` 显式关闭 peer 自动安装，并只允许 `esbuild` 的安装脚本，保证 clean-temp `pnpm install --frozen-lockfile` 可复现。
 
 因此发布门禁不再通过改名 npm test、跳过安装或屏蔽失败来掩盖问题。

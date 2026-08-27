@@ -1,4 +1,6 @@
 import type { EngineSelection } from '../profile/types.js';
+/** Current durable on-disk schema version for Engine Suite session bindings. */
+export declare const EXTERNAL_ENGINE_BINDING_SCHEMA_VERSION = 2;
 export interface ExternalEngineBinding {
     readonly sessionId: string;
     readonly engineId: string;

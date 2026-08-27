@@ -101,17 +101,27 @@ function assertAllowedKeys(
   value: object,
   allowedKeys: readonly string[],
   optionalKeys: readonly string[],
-  transport: string,
+  label: string,
 ): void {
   const allowed = new Set(allowedKeys)
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new Error(`${transport} MCP server must not declare ${key}`)
+    if (!allowed.has(key)) throw new Error(`${label} must not declare ${key}`)
   }
   for (const key of optionalKeys) {
     if (Object.prototype.hasOwnProperty.call(value, key) && Reflect.get(value, key) === undefined) {
-      throw new Error(`${transport} MCP server must not declare ${key} as undefined`)
+      throw new Error(`${label} must not declare ${key} as undefined`)
     }
   }
+}
+
+function strictObjectSchema<S, T>(schema: z<S, T>, allowedKeys: readonly string[], label: string): z<S, T> {
+  return z.transform(schema, (value): T => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`${label} must be an object`)
+    }
+    assertAllowedKeys(value, allowedKeys, [], label)
+    return value as T
+  })
 }
 
 const mcpServerIdSchema = z.string().min(1).required()
@@ -151,7 +161,7 @@ function normalizeStdioMcpServer(value: SettingsRecord): EngineStdioMcpServer {
     value,
     ['id', 'name', 'transport', 'command', 'args', 'environment', 'credentialRefs'],
     ['args', 'environment', 'credentialRefs'],
-    'stdio',
+    'stdio MCP server',
   )
   const args = optionalStringArray(value['args'], 'MCP args')
   const environment = optionalStringRecord(value['environment'], 'MCP environment')
@@ -172,7 +182,7 @@ function normalizeHttpMcpServer(value: SettingsRecord): EngineHttpMcpServer {
     value,
     ['id', 'name', 'transport', 'url', 'headers', 'credentialRefs'],
     ['headers', 'credentialRefs'],
-    'http',
+    'http MCP server',
   )
   const headers = optionalStringRecord(value['headers'], 'MCP headers')
   const credentialRefs = optionalStringRecord(value['credentialRefs'], 'MCP credentialRefs')
@@ -191,7 +201,7 @@ function normalizeSseMcpServer(value: SettingsRecord): EngineSseMcpServer {
     value,
     ['id', 'name', 'transport', 'url', 'headers', 'credentialRefs'],
     ['headers', 'credentialRefs'],
-    'sse',
+    'sse MCP server',
   )
   const headers = optionalStringRecord(value['headers'], 'MCP headers')
   const credentialRefs = optionalStringRecord(value['credentialRefs'], 'MCP credentialRefs')
@@ -209,6 +219,56 @@ const stdioMcpServerSchema = z.transform(stdioMcpServerInputSchema, normalizeStd
 const httpMcpServerSchema = z.transform(httpMcpServerInputSchema, normalizeHttpMcpServer)
 const sseMcpServerSchema = z.transform(sseMcpServerInputSchema, normalizeSseMcpServer)
 const mcpServerSchema = z.union([stdioMcpServerSchema, httpMcpServerSchema, sseMcpServerSchema])
+const skillSetSchema = strictObjectSchema(z.object({
+  id: z.string().min(1),
+  pluginDirs: z.array(z.string()).default([]),
+  additionalDirectories: z.array(z.string()).default([]),
+}), ['id', 'pluginDirs', 'additionalDirectories'], 'Skill set')
+const mcpSetSchema = strictObjectSchema(z.object({
+  id: z.string().min(1),
+  servers: z.array(mcpServerSchema).default([]),
+}), ['id', 'servers'], 'MCP set')
+const providerSettingsSchema = strictObjectSchema(z.object({
+  id: z.string().min(1),
+  engineId: z.string().min(1),
+  name: z.string().min(1),
+  baseUri: z.string().min(1),
+  credentialRef: z.string().min(1),
+  wireApi: z.union([z.const('responses'), z.const('anthropic')]).default('responses'),
+  authMode: z.union([z.const('api-key'), z.const('auth-token')]).default('api-key'),
+  enabled: z.boolean().default(true),
+}), ['id', 'engineId', 'name', 'baseUri', 'credentialRef', 'wireApi', 'authMode', 'enabled'], 'Provider settings')
+const profileSettingsSchema = strictObjectSchema(z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  engineId: z.string().min(1),
+  providerId: z.string().min(1),
+  modelRecordId: z.string().min(1),
+  reasoningEffort: z.string(),
+  skillSetRef: z.string(),
+  mcpSetRef: z.string(),
+  allowedChildProfiles: z.array(z.string().min(1)).default([]),
+  maxChildDepth: z.number().step(1).min(0).default(1),
+  maxConcurrentChildren: z.number().step(1).min(1).default(1),
+  enabled: z.boolean().default(true),
+}), ['id', 'name', 'engineId', 'providerId', 'modelRecordId', 'reasoningEffort', 'skillSetRef', 'mcpSetRef', 'allowedChildProfiles', 'maxChildDepth', 'maxConcurrentChildren', 'enabled'], 'Profile settings')
+const modelSettingsSchema = strictObjectSchema(z.object({
+  id: z.string().min(1),
+  engineId: z.string().min(1),
+  providerId: z.string().min(1),
+  modelId: z.string().min(1),
+  displayName: z.string(),
+  enabled: z.boolean().default(true),
+  hidden: z.boolean().default(false),
+  reasoningOptions: z.array(z.string()).default([]),
+  defaultReasoningEffort: z.string(),
+  contextWindowTokens: z.number().step(1).min(1),
+  contextWindowSource: z.union([
+    z.const('discovered'),
+    z.const('manual'),
+    z.const('unknown'),
+  ]).default('unknown'),
+}), ['id', 'engineId', 'providerId', 'modelId', 'displayName', 'enabled', 'hidden', 'reasoningOptions', 'defaultReasoningEffort', 'contextWindowTokens', 'contextWindowSource'], 'Model settings')
 
 function assertActiveModelPolicy(model: Pick<EngineSuiteModelSettings, 'engineId' | 'modelId' | 'displayName'>): void {
   const modelText = `${model.modelId} ${model.displayName ?? ''}`.toLocaleLowerCase()
@@ -244,58 +304,14 @@ export interface EngineSuiteSettings {
   readonly mcpSets?: EngineSuiteMcpSetSettings[]
 }
 
-export const EngineSuiteSettingsSchema: z<EngineSuiteSettings> = z.object({
-  skillSets: z.array(z.object({
-    id: z.string().min(1),
-    pluginDirs: z.array(z.string()).default([]),
-    additionalDirectories: z.array(z.string()).default([]),
-  })).default([]),
-  mcpSets: z.array(z.object({
-    id: z.string().min(1),
-    servers: z.array(mcpServerSchema).default([]),
-  })).default([]),
-  providers: z.array(z.object({
-    id: z.string().min(1),
-    engineId: z.string().min(1),
-    name: z.string().min(1),
-    baseUri: z.string().min(1),
-    credentialRef: z.string().min(1),
-    wireApi: z.union([z.const('responses'), z.const('anthropic')]).default('responses'),
-    authMode: z.union([z.const('api-key'), z.const('auth-token')]).default('api-key'),
-    enabled: z.boolean().default(true),
-  })).default([]),
-  profiles: z.array(z.object({
-    id: z.string().min(1),
-    name: z.string(),
-    engineId: z.string().min(1),
-    providerId: z.string().min(1),
-    modelRecordId: z.string().min(1),
-    reasoningEffort: z.string(),
-    skillSetRef: z.string(),
-    mcpSetRef: z.string(),
-    allowedChildProfiles: z.array(z.string().min(1)).default([]),
-    maxChildDepth: z.number().step(1).min(0).default(1),
-    maxConcurrentChildren: z.number().step(1).min(1).default(1),
-    enabled: z.boolean().default(true),
-  })).default([]),
-  models: z.array(z.object({
-    id: z.string().min(1),
-    engineId: z.string().min(1),
-    providerId: z.string().min(1),
-    modelId: z.string().min(1),
-    displayName: z.string(),
-    enabled: z.boolean().default(true),
-    hidden: z.boolean().default(false),
-    reasoningOptions: z.array(z.string()).default([]),
-    defaultReasoningEffort: z.string(),
-    contextWindowTokens: z.number().step(1).min(1),
-    contextWindowSource: z.union([
-      z.const('discovered'),
-      z.const('manual'),
-      z.const('unknown'),
-    ]).default('unknown'),
-  })).default([]),
-})
+export const EngineSuiteSettingsSchema: z<EngineSuiteSettings> = strictObjectSchema(z.object({
+  skillSets: z.array(skillSetSchema).default([]),
+  mcpSets: z.array(mcpSetSchema).default([]),
+  providers: z.array(providerSettingsSchema).default([]),
+  profiles: z.array(profileSettingsSchema).default([]),
+  models: z.array(modelSettingsSchema).default([]),
+}), ['skillSets', 'mcpSets', 'providers', 'profiles', 'models'], 'Engine Suite settings')
+
 
 
 /**
@@ -347,7 +363,7 @@ export function syncEngineSuiteSettings(
             server,
             ['id', 'name', 'transport', 'command', 'args', 'environment', 'credentialRefs'],
             ['args', 'environment', 'credentialRefs'],
-            'stdio',
+            'stdio MCP server',
           )
           const args = optionalStringArray(server.args, 'MCP args')
           const environment = optionalStringRecord(server.environment, 'MCP environment')
@@ -367,7 +383,7 @@ export function syncEngineSuiteSettings(
             server,
             ['id', 'name', 'transport', 'url', 'headers', 'credentialRefs'],
             ['headers', 'credentialRefs'],
-            'http',
+            'http MCP server',
           )
           const headers = optionalStringRecord(server.headers, 'MCP headers')
           const credentialRefs = optionalStringRecord(server.credentialRefs, 'MCP credentialRefs')
@@ -385,7 +401,7 @@ export function syncEngineSuiteSettings(
             server,
             ['id', 'name', 'transport', 'url', 'headers', 'credentialRefs'],
             ['headers', 'credentialRefs'],
-            'sse',
+            'sse MCP server',
           )
           const headers = optionalStringRecord(server.headers, 'MCP headers')
           const credentialRefs = optionalStringRecord(server.credentialRefs, 'MCP credentialRefs')

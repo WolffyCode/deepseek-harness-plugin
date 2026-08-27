@@ -257,13 +257,34 @@ export function EngineSuiteSection({ scope, catalog: controller }: EngineSuiteSe
     event.preventDefault()
     const id = mcpSetId.trim()
     if (id === '') { setMessage('MCP set ID is required'); return }
-    const server: EngineSuiteMcpServerSettings = {
-      id: mcpServerId.trim(),
-      name: mcpServerName.trim(),
-      transport: mcpTransport,
-      args: mcpArgs.split(',').map(value => value.trim()).filter(Boolean),
-      ...mcpCommand.trim() === '' ? {} : { command: mcpCommand.trim() },
-      ...mcpUrl.trim() === '' ? {} : { url: mcpUrl.trim() },
+    const serverId = mcpServerId.trim()
+    const serverName = mcpServerName.trim()
+    if (serverId === '' || serverName === '') {
+      setMessage('MCP server ID and name are required')
+      return
+    }
+    let server: EngineSuiteMcpServerSettings
+    if (mcpTransport === 'stdio') {
+      const command = mcpCommand.trim()
+      if (command === '') {
+        setMessage('MCP command is required for stdio transport')
+        return
+      }
+      const args = mcpArgs.split(',').map(value => value.trim()).filter(Boolean)
+      server = {
+        id: serverId,
+        name: serverName,
+        transport: 'stdio',
+        command,
+        ...(args.length === 0 ? {} : { args }),
+      }
+    } else {
+      const url = mcpUrl.trim()
+      if (url === '') {
+        setMessage('MCP URL is required for HTTP transport')
+        return
+      }
+      server = { id: serverId, name: serverName, transport: 'http', url }
     }
     const set: EngineSuiteMcpSetSettings = { id, servers: [server] }
     try {

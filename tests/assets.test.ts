@@ -47,6 +47,25 @@ test('Engine settings preserve every MCP transport field without persisting secr
   }])
 })
 
+test('Engine settings reject unknown provider and profile fields instead of persisting credentials', () => {
+  assert.throws(() => EngineSuiteSettingsSchema({
+    providers: [{
+      id: 'provider', engineId: 'codex-cli', name: 'Provider', baseUri: 'https://example.test',
+      credentialRef: 'provider-ref', apiKey: 'must-not-persist',
+    }],
+    models: [],
+  } as never), /Provider settings must not declare apiKey/u)
+  assert.throws(() => EngineSuiteSettingsSchema({
+    providers: [],
+    models: [],
+    profiles: [{
+      id: 'profile', engineId: 'codex-cli', providerId: 'provider', modelRecordId: 'model',
+      allowedChildProfiles: [], maxChildDepth: 1, maxConcurrentChildren: 1, enabled: true,
+      credential: 'must-not-persist',
+    }],
+  } as never), /Profile settings must not declare credential/u)
+})
+
 test('Engine settings reject transport-exclusive fields and explicit undefined fields', async () => {
   const parse = async (server: unknown): Promise<unknown> => {
     const result = await EngineSuiteSettingsSchema['~standard'].validate({

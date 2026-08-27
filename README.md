@@ -16,7 +16,7 @@ Claude 源码在 `src/claude/`，通用桥在 `src/agent/`，Codex 源码在 `sr
 
 ## 独立安装
 
-本仓库是单包 pnpm workspace，`pnpm-workspace.yaml` 固定 `autoInstallPeers: false`，`packageManager` 固定为 `pnpm@11.11.0`。`pnpm-lock.yaml` 与该设置一致，开发用 peer 依赖显式锁定在当前 Harness 发布线，因此安装和 test 不依赖父目录 workspace 或 symlink。发布包直接提交生成后的 `lib` artifacts；运行 typecheck/build 重新生成 Typert Remote artifacts 时，脚本只读父仓库中的 generator/protocol 源码。
+本仓库是单包 pnpm workspace，`pnpm-workspace.yaml` 固定 `autoInstallPeers: false`，只允许 `esbuild` 执行安装脚本，`packageManager` 固定为 `pnpm@11.11.0`。`pnpm-lock.yaml` 与该设置一致，开发用 peer 依赖和 Typert generator 显式锁定在当前 Harness 发布线，因此安装、typecheck、build 和 test 不依赖父仓库 workspace 或 symlink。发布包直接提交生成后的 `lib` artifacts；Typert Remote 由发布的 generator 和仓库内的 protocol 编译 fixture 在临时 workspace 中生成。
 
 ```bash
 pnpm install
@@ -28,7 +28,7 @@ pnpm pack --dry-run
 git diff --check
 ```
 
-依赖安装和测试不读取父目录 `deepseek-harness`；typecheck/build 的 Typert 生成步骤会只读父仓库 generator/protocol 源码来生成 Remote artifact。npm 可用的旧 generator 不具备该能力，因此文档明确保留这个源码重生成前置，而不是用兼容层掩盖。
+依赖安装、typecheck、build 和 test 不读取父目录 `deepseek-harness`。Typert 生成步骤使用发布的 `@deepseek-ai/dsh-typert-generator`，并在一次性临时 workspace 中使用仓库内的 protocol 编译 fixture；临时目录在成功或失败后都会删除。
 
 ## pnpm 404 根因
 
@@ -60,4 +60,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **200 tests / 198 pass / 0 fail / 2 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run` 和 `git diff --check` 均通过。两个 skip 仅来自缺少必需的真实 Claude Provider 环境变量；带凭据的真实 Claude、MCP/Skill 和浏览器 E2E 必须单独执行，不能由这两个 skip 代替。
+截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **212 tests / 208 pass / 0 fail / 4 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run`、clean-temp package install/pack smoke 和 `git diff --check` 均通过。4 个 skip 都是显式外部 E2E：2 个需要真实 Claude Provider，2 个需要真实跨引擎 Provider；它们不计为 pass，带凭据的真实 Claude、MCP/Skill、跨引擎和浏览器 E2E 必须单独执行。

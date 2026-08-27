@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -46,6 +46,51 @@ test('binding writes from independent service instances preserve every native se
     await Promise.all(expected.map((value, index) => (index % 2 === 0 ? first : second).put(value)))
     const actual = await Promise.all(expected.map(value => first.get(value.sessionId)))
     assert.deepEqual(actual, expected)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('binding store migrates the legacy v1 thread id and writes the v2 schema', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-bindings-migration-test-'))
+  const file = join(root, 'engine-bindings.json')
+  const legacy = {
+    version: 1,
+    bindings: [{
+      ...binding('legacy-session'),
+      nativeSessionId: undefined,
+      threadId: 'legacy-native',
+    }],
+  }
+  try {
+    await writeFile(file, `${JSON.stringify(legacy)}\n`, { mode: 0o600 })
+    const store = new ExternalEngineBindingStore(file)
+    assert.deepEqual(await store.get('legacy-session'), {
+      ...binding('legacy-session'),
+      nativeSessionId: 'legacy-native',
+    })
+    await store.put({
+      ...binding('legacy-session'),
+      nativeSessionId: 'legacy-native',
+    })
+    const persisted = await readFile(file, 'utf8')
+    assert.match(persisted, /"version": 2/u)
+    assert.doesNotMatch(persisted, /threadId/u)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('binding store rejects unknown fields and credential values instead of dropping them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-engine-bindings-schema-test-'))
+  const file = join(root, 'engine-bindings.json')
+  try {
+    await writeFile(file, JSON.stringify({ version: 2, bindings: [{ ...binding('invalid-session'), apiKey: 'must-not-persist' }] }))
+    await assert.rejects(new ExternalEngineBindingStore(file).get('invalid-session'), /must not declare apiKey/u)
+    await writeFile(file, JSON.stringify({ version: 2, bindings: [{ ...binding('invalid-root'), runtimeRoot: 'relative-runtime' }] }))
+    await assert.rejects(new ExternalEngineBindingStore(file).get('invalid-root'), /runtimeRoot must be an absolute path/u)
+    await writeFile(file, JSON.stringify({ version: 2, bindings: [{ ...binding('invalid-args'), args: ['--api-key', 'must-not-persist'] }] }))
+    await assert.rejects(new ExternalEngineBindingStore(file).get('invalid-args'), /must not carry credentials/u)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
