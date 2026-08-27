@@ -343,7 +343,8 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     await withTimeout(readiness, 'Claude assets initialization', INITIALIZATION_TIMEOUT_MS)
 
     const catalog = await withTimeout(session.refreshCatalog(), 'Claude assets catalog refresh', INITIALIZATION_TIMEOUT_MS)
-    assert.ok(catalog.commands.some(command => command.name === SKILL_NAME), `local skill command ${SKILL_NAME} was not returned by supportedCommands()`)
+    const skillCommand = catalog.commands.find(command => command.name === SKILL_NAME || command.name.endsWith(`:${SKILL_NAME}`))
+    assert.ok(skillCommand, `local skill command ${SKILL_NAME} was not returned by supportedCommands()`)
 
     const mcpTurn = await runTurn(session, `Use the local MCP server asset-fixture. Call its asset_echo tool exactly once with the text ${MCP_INPUT}. Do not use any other tool. After the tool returns, reply with exactly ${MCP_RESPONSE}.`)
     const auditEntries = await readAudit(auditPath)
@@ -364,7 +365,7 @@ test('Claude real MCP + local Skill assets E2E (opt-in, GLM-only)', { skip: pref
     assert.equal(calls.length, 1, 'fixture MCP tool was not called exactly once')
     assert.deepEqual(calls[0], { method: 'tools/call', name: 'asset_echo', text: MCP_INPUT })
 
-    const skillTurn = await runTurn(session, `/${SKILL_NAME}`)
+    const skillTurn = await runTurn(session, `/${skillCommand.name}`)
     const skillDiagnostics = `finalText=${JSON.stringify(skillTurn.finalText)} events=${JSON.stringify(skillTurn.events)}`
     assert.equal(skillTurn.finalText.includes(SKILL_RESPONSE), true, `the model did not load and follow the local Skill command; ${skillDiagnostics}`)
 
