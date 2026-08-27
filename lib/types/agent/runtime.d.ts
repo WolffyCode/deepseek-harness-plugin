@@ -25,10 +25,13 @@ export interface ExternalEngineRuntime {
 import type { ClaudeAgentSession } from "../claude/types.js";
 export declare class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
     readonly session: ClaudeAgentSession;
+    private readonly processExited;
+    private readonly resolveProcessExited;
     readonly process: {
-        exited: Promise<undefined>;
-        stderrTail: string;
+        readonly exited: Promise<void>;
+        readonly stderrTail: string;
     };
+    private readonly partialAssistantTurns;
     private readonly listeners;
     private readonly unsubscribe;
     private activeTurnId;

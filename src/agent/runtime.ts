@@ -377,7 +377,10 @@ function toPermission(request: ClaudePermissionRequest): AgentPermissionRequest 
 }
 
 export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
-  readonly process = { exited: Promise.resolve(undefined), stderrTail: "" };
+  private readonly processExited: Promise<void>
+  private readonly resolveProcessExited: () => void
+  readonly process: { readonly exited: Promise<void>; readonly stderrTail: string }
+  private readonly partialAssistantTurns = new Set<string>()
   private readonly listeners = new Set<ExternalEngineEventHandler>();
   private readonly unsubscribe: () => void;
   private activeTurnId: string | undefined;
@@ -386,12 +389,17 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
   private closed = false;
 
   constructor(readonly session: ClaudeAgentSession) {
+    let resolveProcessExited!: () => void
+    this.processExited = new Promise<void>(resolve => { resolveProcessExited = resolve })
+    this.resolveProcessExited = resolveProcessExited
+    this.process = { exited: this.processExited, stderrTail: "" }
     this.unsubscribe = session.subscribe(event => {
       if (event.type === "turn_started") {
         this.activeTurnId = event.turnId;
         this.interruptTurnId = undefined;
         this.interruptPromise = undefined;
       }
+      if (event.type === "process_exited") this.resolveProcessExited()
       const projected = this.project(event);
       if (projected !== undefined) for (const listener of [...this.listeners]) listener(projected);
       if (event.type === "turn_completed" || event.type === "turn_failed" || event.type === "turn_canceled") {
@@ -436,6 +444,7 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
     this.closed = true;
     this.unsubscribe();
     await this.session.close();
+    this.resolveProcessExited();
   }
 
   private project(event: ClaudeAdapterEvent): AgentStreamEvent | undefined {
@@ -443,13 +452,30 @@ export class ClaudeSessionRuntimeBridge implements ExternalEngineRuntime {
     switch (event.type) {
       case "session_started": return { type: "thread_started", provider, sessionId: event.sessionId };
       case "turn_started": return { type: "turn_started", provider, turnId: event.turnId };
-      case "timeline": return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item: this.timeline(event.item) };
+      case "timeline": {
+        if (event.item.type === "assistant_message" && event.item.partial === true && event.turnId !== undefined) {
+          this.partialAssistantTurns.add(event.turnId)
+        }
+        if (event.item.type === "assistant_message" && event.item.partial !== true && event.turnId !== undefined && this.partialAssistantTurns.has(event.turnId)) {
+          return undefined
+        }
+        return { type: "timeline", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), item: this.timeline(event.item) };
+      }
       case "usage_updated": return { type: "usage_updated", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), usage: toUsage(event.usage) };
       case "permission_requested": return { type: "permission_requested", provider, request: toPermission(event.request) };
-      case "status_changed": return { type: "error", provider, error: event.status };
-      case "turn_completed": return { type: "turn_completed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), ...(event.usage === undefined ? {} : { usage: toUsage(event.usage) }) };
-      case "turn_failed": return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error };
-      case "turn_canceled": return { type: "turn_canceled", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), reason: "canceled" };
+      case "status_changed": return undefined;
+      case "turn_completed": {
+        if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
+        return { type: "turn_completed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), ...(event.usage === undefined ? {} : { usage: toUsage(event.usage) }) };
+      }
+      case "turn_failed": {
+        if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
+        return { type: "turn_failed", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), error: event.error };
+      }
+      case "turn_canceled": {
+        if (event.turnId !== undefined) this.partialAssistantTurns.delete(event.turnId)
+        return { type: "turn_canceled", provider, ...(event.turnId === undefined ? {} : { turnId: event.turnId }), reason: "canceled" };
+      }
       default: return undefined;
     }
   }
