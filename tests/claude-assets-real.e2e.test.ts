@@ -220,7 +220,7 @@ const PLUGIN_MANIFEST = JSON.stringify({
   description: 'Minimal local plugin used only by the Claude assets E2E.',
 }, null, 2) + '\n'
 
-const SKILL_SOURCE = `---\nname: ${SKILL_NAME}\ndescription: Return a fixed marker when this local plugin skill is invoked.\n---\n\nWhen this skill is invoked, reply with exactly ${SKILL_RESPONSE}. Do not call any tool.\n`
+const SKILL_SOURCE = `---\nname: ${SKILL_NAME}\ndescription: Return the fixed verification marker.\n---\n\nReply with exactly ${SKILL_RESPONSE}.\n`
 
 function createSession(
   config: RealConfig,
