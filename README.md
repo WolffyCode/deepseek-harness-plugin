@@ -14,7 +14,17 @@
 
 Claude 源码在 `src/claude/`，通用桥在 `src/agent/`，Codex 源码在 `src/codex/`。不存在旧的 Claude `launch.ts` 或 `runtime.ts` 文件。
 
-## 独立安装
+## 从 GitHub 安装
+
+本插件不通过 npm 分发。使用固定的 GitHub Release tag 安装到目标 Profile：
+
+```bash
+dsh plugin --profile web add github:WolffyCode/deepseek-harness-plugin#v0.1.0
+```
+
+安装或更新 Profile Bundle 后需要重启对应的 DeepSeek Harness 进程。安装命令会把仓库声明的 `@wolffycode/dsh-engine-suite` Bundle 加入 Profile；不要使用浮动的 `main` 分支代替发布 tag。
+
+## 源码开发与验证
 
 本仓库是单包 pnpm workspace，`pnpm-workspace.yaml` 固定 `autoInstallPeers: false`，只允许 `esbuild` 执行安装脚本，`packageManager` 固定为 `pnpm@11.11.0`。`pnpm-lock.yaml` 与该设置一致，开发用 peer 依赖和 Typert generator 显式锁定在当前 Harness 发布线，因此安装、typecheck、build 和 test 不依赖父仓库 workspace 或 symlink。发布包直接提交生成后的 `lib` artifacts；Typert Remote 由发布的 generator 和仓库内的 protocol 编译 fixture 在临时 workspace 中生成。
 
@@ -60,4 +70,4 @@ DSH_DEBUG_CODEX_API_KEY="$CODEX_KEY" \
 npm run verify:codex
 ```
 
-截至 2026-08-27，本地无凭据门禁 `pnpm test` 为 **212 tests / 208 pass / 0 fail / 4 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run`、clean-temp package install/pack smoke 和 `git diff --check` 均通过。4 个 skip 都是显式外部 E2E：2 个需要真实 Claude Provider，2 个需要真实跨引擎 Provider；它们不计为 pass，带凭据的真实 Claude、MCP/Skill、跨引擎和浏览器 E2E 必须单独执行。
+截至 2026-08-29，本地无凭据门禁 `pnpm test` 为 **231 tests / 227 pass / 0 fail / 4 external skips**；`pnpm typecheck`、`pnpm build`、`pnpm pack --dry-run`、clean-temp package install/pack smoke 和 `git diff --check` 均通过。4 个 skip 都是显式外部 E2E：2 个需要真实 Claude Provider，2 个需要真实跨引擎 Provider；它们不计为 pass，带凭据的真实 Claude、MCP/Skill、跨引擎和浏览器 E2E 必须单独执行。
